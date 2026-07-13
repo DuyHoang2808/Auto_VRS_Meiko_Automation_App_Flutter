@@ -1,0 +1,13 @@
+{
+  "api_base_url": "http://localhost:8000",
+  "coord_ws_url": "ws://127.0.0.1:8765",
+  "autovrs_ws_url": "ws://192.168.10.165:8999",
+  "autovrs_rtsp_url": "rtsp://192.168.10.165:8551/mystream",
+  "video_frame_ws_url": "ws://localhost:8081",
+  "camera_ws_url": "ws://localhost:8999",
+  "ai_base_url": "http://localhost:8082",
+  "qcamber_base_url": "http://localhost:8686",
+  "plc_gateway_base_url": "http://localhost:8083",
+  "ffmpeg_path": "ffmpeg",
+  "rtsp_fps": "15"
+}

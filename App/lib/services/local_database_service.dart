@@ -1,0 +1,814 @@
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import 'package:flutter/foundation.dart';
+import 'dart:io';
+
+class LocalDatabaseService {
+  static final LocalDatabaseService _instance =
+      LocalDatabaseService._internal();
+  factory LocalDatabaseService() => _instance;
+  LocalDatabaseService._internal();
+
+  Database? _db;
+  bool _isInitializing = false;
+
+  Future<Database> get database async {
+    // Nếu database đã được khởi tạo, trả về ngay
+    if (_db != null && _db!.isOpen) {
+      return _db!;
+    }
+
+    // Nếu đang khởi tạo, đợi
+    if (_isInitializing) {
+      while (_isInitializing) {
+        await Future.delayed(Duration(milliseconds: 10));
+      }
+      if (_db != null && _db!.isOpen) {
+        return _db!;
+      }
+    }
+
+    // Khởi tạo database
+    _isInitializing = true;
+    try {
+      _db = await _initDatabase();
+      return _db!;
+    } finally {
+      _isInitializing = false;
+    }
+  }
+
+  Future<Database> _initDatabase() async {
+    String path;
+
+    try {
+      if (Platform.isWindows) {
+        // Sử dụng thư mục Documents của user
+        final userProfile =
+            Platform.environment['USERPROFILE'] ?? 'C:\\Users\\Default';
+        final documentsDir = Directory(
+          join(userProfile, 'Documents', 'AutoVRS'),
+        );
+
+        // Tạo thư mục nếu không tồn tại
+        if (!await documentsDir.exists()) {
+          await documentsDir.create(recursive: true);
+        }
+
+        path = join(documentsDir.path, 'autovrs.db');
+      } else {
+        final dbPath = await getDatabasesPath();
+        final dbDir = Directory(dirname(join(dbPath, 'autovrs.db')));
+        if (!await dbDir.exists()) {
+          await dbDir.create(recursive: true);
+        }
+        path = join(dbPath, 'autovrs.db');
+      }
+
+      debugPrint('Database path: $path');
+
+      // If the database file exists but is not writable (e.g., read-only attribute),
+      // attempt to create a writable copy and use that instead. This handles cases
+      // where the app might be pointing at a bundled/read-only DB.
+      final dbFile = File(path);
+      if (await dbFile.exists()) {
+        debugPrint('📁 Database file exists, checking write permissions...');
+        try {
+          final raf = await dbFile.open(mode: FileMode.append);
+          await raf.close();
+          debugPrint('✅ Database file is writable');
+        } catch (e) {
+          debugPrint(
+            '⚠️ Database file not writable ($e). Attempting writable fallback.',
+          );
+          final dir = dbFile.parent.path;
+          final fallbackPath = join(dir, 'autovrs_rw.db');
+          final fallbackFile = File(fallbackPath);
+          if (!await fallbackFile.exists()) {
+            // copy read-only DB to writable copy
+            debugPrint('📋 Copying to fallback: $fallbackPath');
+            await dbFile.copy(fallbackPath);
+            debugPrint('✅ Copied DB to writable fallback: $fallbackPath');
+          } else {
+            debugPrint('✅ Using existing writable fallback DB: $fallbackPath');
+          }
+          path = fallbackPath;
+        }
+      } else {
+        debugPrint(
+          '📝 Database file does not exist, will be created at: $path',
+        );
+        // Ensure parent directory is writable
+        final dir = dbFile.parent;
+        if (!await dir.exists()) {
+          await dir.create(recursive: true);
+          debugPrint('✅ Created database directory: ${dir.path}');
+        }
+
+        // Test if we can write to this directory
+        try {
+          final testFile = File(join(dir.path, '.write_test'));
+          await testFile.writeAsString('test');
+          await testFile.delete();
+          debugPrint('✅ Directory is writable');
+        } catch (e) {
+          debugPrint('❌ Directory not writable: $e');
+          throw Exception(
+            'Cannot write to database directory: ${dir.path}. Error: $e',
+          );
+        }
+      }
+
+      // Try to open database with retry logic for read-only issues
+      try {
+        return await openDatabase(
+          path,
+          version: 1,
+          onConfigure: _configureDatabase,
+          onCreate: _createTables,
+          onOpen: (db) async {
+            debugPrint('Database opened successfully at $path');
+            // Kiểm tra và tạo cột id_model nếu chưa tồn tại
+            await _migrateDatabase(db);
+          },
+          readOnly: false, // ✅ Explicitly set writable mode
+          singleInstance: true, // ✅ Prevent multiple instances
+        );
+      } catch (e) {
+        final errMsg = e.toString();
+        // If read-only error during open, try fallback immediately
+        if (errMsg.toLowerCase().contains('read-only') ||
+            errMsg.toLowerCase().contains('read only') ||
+            errMsg.toLowerCase().contains('readonly')) {
+          debugPrint('⚠️ Database open failed (read-only): $e');
+          debugPrint('🔄 Attempting writable fallback database...');
+
+          final dir = dbFile.parent.path;
+          final fallbackPath = join(dir, 'autovrs_rw.db');
+          debugPrint('📂 Fallback path: $fallbackPath');
+
+          return await openDatabase(
+            fallbackPath,
+            version: 1,
+            onConfigure: _configureDatabase,
+            onCreate: _createTables,
+            onOpen: (db) async {
+              debugPrint('✅ Fallback database opened at $fallbackPath');
+              await _migrateDatabase(db);
+            },
+            readOnly: false,
+            singleInstance: true,
+          );
+        }
+        rethrow;
+      }
+    } catch (e) {
+      debugPrint('Error creating database: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> _configureDatabase(Database db) async {
+    await db.execute('PRAGMA busy_timeout = 5000');
+    await db.execute('PRAGMA journal_mode = WAL');
+  }
+
+  Future<void> _migrateDatabase(Database db) async {
+    try {
+      // Kiểm tra xem cột id_model đã tồn tại trong tbModel chưa
+      final info = await db.rawQuery("PRAGMA table_info(tbModel)");
+      final hasIdModel = info.any((col) => col['name'] == 'id_model');
+
+      if (!hasIdModel) {
+        debugPrint('⚠️ Migration: Adding id_model column to tbModel');
+        await db.execute(
+          'ALTER TABLE tbModel ADD COLUMN id_model INTEGER PRIMARY KEY',
+        );
+        debugPrint('✅ Migration completed: id_model column added');
+      }
+
+      // Kiểm tra tbLot có cột tbModelid_model chưa
+      final lotInfo = await db.rawQuery("PRAGMA table_info(tbLot)");
+      final hasTbModelIdModel = lotInfo.any(
+        (col) => col['name'] == 'tbModelid_model',
+      );
+
+      if (!hasTbModelIdModel) {
+        debugPrint('⚠️ Migration: Adding tbModelid_model column to tbLot');
+        try {
+          await db.execute(
+            'ALTER TABLE tbLot ADD COLUMN tbModelid_model INTEGER',
+          );
+          debugPrint('✅ Migration completed: tbModelid_model column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add tbModelid_model to tbLot: $e');
+        }
+      }
+
+      // Kiểm tra tbBoard có cột tbLotid_lot chưa
+      final boardInfo = await db.rawQuery("PRAGMA table_info(tbBoard)");
+      final hasTbLotIdLot = boardInfo.any(
+        (col) => col['name'] == 'tbLotid_lot',
+      );
+
+      if (!hasTbLotIdLot) {
+        debugPrint('⚠️ Migration: Adding tbLotid_lot column to tbBoard');
+        try {
+          await db.execute(
+            'ALTER TABLE tbBoard ADD COLUMN tbLotid_lot INTEGER',
+          );
+          debugPrint('✅ Migration completed: tbLotid_lot column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add tbLotid_lot to tbBoard: $e');
+        }
+      }
+
+      // Kiểm tra tbDefect có cột plc_coor chưa. Cột này lưu tọa độ đã quy đổi
+      // sang hệ PLC (định dạng "x;y", ví dụ "19.887;5.86") — vrs_main_screen.dart
+      // và manual_vrs_screen.dart đọc trực tiếp cột này để di chuyển camera.
+      final defectInfo = await db.rawQuery("PRAGMA table_info(tbDefect)");
+      final hasPlcCoor = defectInfo.any((col) => col['name'] == 'plc_coor');
+
+      if (!hasPlcCoor) {
+        debugPrint('⚠️ Migration: Adding plc_coor column to tbDefect');
+        try {
+          await db.execute('ALTER TABLE tbDefect ADD COLUMN plc_coor TEXT');
+          debugPrint('✅ Migration completed: plc_coor column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add plc_coor to tbDefect: $e');
+        }
+      }
+
+      final updatedDefectInfo = await db.rawQuery(
+        "PRAGMA table_info(tbDefect)",
+      );
+      Map<String, Object?>? urlImageColumn;
+      for (final column in updatedDefectInfo) {
+        if (column['name'] == 'url_image') {
+          urlImageColumn = column;
+          break;
+        }
+      }
+      final urlImageType = (urlImageColumn?['type'] ?? '')
+          .toString()
+          .toUpperCase();
+
+      if (urlImageColumn == null) {
+        debugPrint('Migration: Adding url_image TEXT column to tbDefect');
+        await db.execute('ALTER TABLE tbDefect ADD COLUMN url_image TEXT');
+      } else if (urlImageType != 'TEXT') {
+        debugPrint(
+          'Migration: Rebuilding tbDefect to convert url_image from $urlImageType to TEXT',
+        );
+        await _rebuildTbDefectWithTextUrlImage(db);
+        debugPrint('Migration completed: url_image converted to TEXT');
+      }
+    } catch (e) {
+      debugPrint('⚠️ Migration warning (non-critical): $e');
+      // Không throw - cho phép app tiếp tục chạy
+    }
+  }
+
+  Future<void> _rebuildTbDefectWithTextUrlImage(Database db) async {
+    await db.transaction((txn) async {
+      await txn.execute('DROP TABLE IF EXISTS tbDefect_new');
+      await txn.execute('''
+        CREATE TABLE tbDefect_new (
+          id_defect INTEGER PRIMARY KEY AUTOINCREMENT,
+          type TEXT,
+          judgement TEXT,
+          height REAL,
+          width REAL,
+          time TEXT,
+          coordinates TEXT,
+          url_image TEXT,
+          tbBoardid_board INTEGER,
+          plc_coor TEXT,
+          FOREIGN KEY (tbBoardid_board) REFERENCES tbBoard(id_board)
+        )
+      ''');
+
+      await txn.execute('''
+        INSERT INTO tbDefect_new (
+          id_defect,
+          type,
+          judgement,
+          height,
+          width,
+          time,
+          coordinates,
+          url_image,
+          tbBoardid_board,
+          plc_coor
+        )
+        SELECT
+          id_defect,
+          type,
+          judgement,
+          height,
+          width,
+          time,
+          coordinates,
+          CASE
+            WHEN url_image IS NULL THEN NULL
+            ELSE CAST(url_image AS TEXT)
+          END,
+          tbBoardid_board,
+          plc_coor
+        FROM tbDefect
+      ''');
+
+      await txn.execute('DROP TABLE tbDefect');
+      await txn.execute('ALTER TABLE tbDefect_new RENAME TO tbDefect');
+    });
+  }
+
+  Future<void> _createTables(Database db, int version) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS tbModel (
+        id_model INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        line_size REAL,
+        space_size REAL,
+        url_gerber TEXT
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS tbLot (
+        id_lot INTEGER PRIMARY KEY AUTOINCREMENT,
+        NG_rate REAL,
+        fakeDef REAL,
+        board_quantity INTEGER,
+        tbModelid_model INTEGER,
+        FOREIGN KEY (tbModelid_model) REFERENCES tbModel(id_model)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS tbBoard (
+        id_board INTEGER PRIMARY KEY AUTOINCREMENT,
+        defect_quantity INTEGER,
+        erro_quantity INTEGER,
+        tbLotid_lot INTEGER,
+        FOREIGN KEY (tbLotid_lot) REFERENCES tbLot(id_lot)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS tbDefect (
+        id_defect INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT,
+        judgement TEXT,
+        height REAL,
+        width REAL,
+        time TEXT,
+        coordinates TEXT,
+        url_image TEXT,
+        tbBoardid_board INTEGER,
+        plc_coor TEXT,
+        FOREIGN KEY (tbBoardid_board) REFERENCES tbBoard(id_board)
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS tbConfig (
+        config_key TEXT PRIMARY KEY,
+        config_value TEXT
+      )
+    ''');
+
+    debugPrint('Database tables created successfully');
+  }
+
+  Future<String> get databasePath async {
+    if (Platform.isWindows) {
+      final userProfile =
+          Platform.environment['USERPROFILE'] ?? 'C:\\Users\\Default';
+      final documentsDir = Directory(join(userProfile, 'Documents', 'AutoVRS'));
+      return join(documentsDir.path, 'autovrs.db');
+    } else {
+      final dbPath = await getDatabasesPath();
+      return join(dbPath, 'autovrs.db');
+    }
+  }
+
+  // ========== MODEL OPERATIONS ==========
+  Future<int> insertModel(Map<String, dynamic> model) async {
+    final db = await database;
+    final idModel = await db.insert(
+      'tbModel',
+      model,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    return idModel;
+  }
+
+  Future<List<Map<String, dynamic>>> getAllModels() async {
+    final db = await database;
+    return await db.query('tbModel');
+  }
+
+  /// Delete a model by its id_model. Returns number of rows deleted.
+  Future<int> deleteModel(int id) async {
+    final db = await database;
+    return await db.delete('tbModel', where: 'id_model = ?', whereArgs: [id]);
+  }
+
+  Future<Map<String, dynamic>?> getModelById(int id) async {
+    final db = await database;
+    final results = await db.query(
+      'tbModel',
+      where: 'id_model = ?',
+      whereArgs: [id],
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<Map<String, dynamic>?> getActiveModel() async {
+    final db = await database;
+    // Just return the first model for now since there's no is_active column
+    final results = await db.query('tbModel', limit: 1);
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  // ========== LOT OPERATIONS ==========
+  Future<int> insertLot(Map<String, dynamic> lot) async {
+    final db = await database;
+    return await db.insert(
+      'tbLot',
+      lot,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getAllLots() async {
+    final db = await database;
+    return await db.query('tbLot', orderBy: 'id_lot DESC');
+  }
+
+  Future<Map<String, dynamic>?> getLotById(int idLot) async {
+    final db = await database;
+    final results = await db.query(
+      'tbLot',
+      where: 'id_lot = ?',
+      whereArgs: [idLot],
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  // ========== BOARD OPERATIONS ==========
+  Future<int> insertBoard(Map<String, dynamic> board) async {
+    final db = await database;
+    return await db.insert(
+      'tbBoard',
+      board,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getAllBoards() async {
+    final db = await database;
+    return await db.query('tbBoard', orderBy: 'id_board DESC');
+  }
+
+  Future<List<Map<String, dynamic>>> getBoardsByLot(int idLot) async {
+    final db = await database;
+    return await db.query(
+      'tbBoard',
+      where: 'tbLotid_lot = ?',
+      whereArgs: [idLot],
+      orderBy: 'id_board DESC',
+    );
+  }
+
+  Future<Map<String, dynamic>?> getBoardById(int idBoard) async {
+    final db = await database;
+    final results = await db.query(
+      'tbBoard',
+      where: 'id_board = ?',
+      whereArgs: [idBoard],
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  // ========== DEFECT OPERATIONS ==========
+  Future<int> insertDefect(Map<String, dynamic> defect) async {
+    final db = await database;
+    return await db.insert(
+      'tbDefect',
+      defect,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getAllDefects() async {
+    final db = await database;
+    return await db.query('tbDefect', orderBy: 'time DESC');
+  }
+
+  Future<List<Map<String, dynamic>>> getDefectsByBoard(int idBoard) async {
+    final db = await database;
+    return await db.query(
+      'tbDefect',
+      where: 'tbBoardid_board = ?',
+      whereArgs: [idBoard],
+      // Order by primary key (insertion order) for deterministic processing
+      orderBy: 'id_defect ASC',
+    );
+  }
+
+  Future<Map<String, dynamic>?> getDefectById(int idDefect) async {
+    final db = await database;
+    final results = await db.query(
+      'tbDefect',
+      where: 'id_defect = ?',
+      whereArgs: [idDefect],
+      limit: 1,
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  Future<List<Map<String, dynamic>>> getDefectsByType(String defectType) async {
+    final db = await database;
+    return await db.query(
+      'tbDefect',
+      where: 'type = ?',
+      whereArgs: [defectType],
+      orderBy: 'time DESC',
+    );
+  }
+
+  /// Update fields of a defect row by its id_defect.
+  /// Returns number of rows affected.
+  Future<int> updateDefect(int idDefect, Map<String, dynamic> fields) async {
+    Database db = await database;
+    try {
+      final result = await _updateDefectWithRetry(db, idDefect, fields);
+      debugPrint(
+        '✅ Updated defect $idDefect successfully ($result rows affected)',
+      );
+      return result;
+    } catch (e) {
+      debugPrint('❌ LocalDatabaseService.updateDefect failed: $e');
+      final errMsg = e.toString();
+      // If failure caused by read-only file system, try to reinitialize DB (will trigger writable fallback)
+      if (errMsg.toLowerCase().contains('read-only') ||
+          errMsg.toLowerCase().contains('read only')) {
+        debugPrint(
+          '🔄 Detected read-only DB; attempting to reopen database and retry update',
+        );
+        try {
+          if (_db != null) {
+            try {
+              await _db!.close();
+            } catch (_) {}
+            _db = null;
+          }
+          db =
+              await database; // re-open (fallback copy logic in _initDatabase will run)
+          final retryResult = await _updateDefectWithRetry(
+            db,
+            idDefect,
+            fields,
+          );
+          debugPrint(
+            '✅ Retry successful: Updated defect $idDefect ($retryResult rows affected)',
+          );
+          return retryResult; // ✅ Return success, don't rethrow!
+        } catch (re) {
+          debugPrint('❌ Retry after reopening DB failed: $re');
+          rethrow;
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<int> _updateDefectWithRetry(
+    Database db,
+    int idDefect,
+    Map<String, dynamic> fields,
+  ) async {
+    const retryDelays = [
+      Duration(milliseconds: 120),
+      Duration(milliseconds: 300),
+      Duration(milliseconds: 700),
+    ];
+
+    for (var attempt = 0; attempt <= retryDelays.length; attempt++) {
+      try {
+        return await db.update(
+          'tbDefect',
+          fields,
+          where: 'id_defect = ?',
+          whereArgs: [idDefect],
+        );
+      } catch (e) {
+        final errMsg = e.toString().toLowerCase();
+        final isLocked =
+            errMsg.contains('database is locked') ||
+            errMsg.contains('sqlite_error: 5') ||
+            errMsg.contains('database locked');
+
+        if (!isLocked || attempt == retryDelays.length) {
+          rethrow;
+        }
+
+        debugPrint(
+          'Database locked while updating defect $idDefect; retry ${attempt + 1}/${retryDelays.length}',
+        );
+        await Future.delayed(retryDelays[attempt]);
+      }
+    }
+
+    throw StateError('Unreachable update retry state');
+  }
+
+  // ========== CONFIG OPERATIONS ==========
+  Future<int> insertConfig(Map<String, dynamic> config) async {
+    final db = await database;
+    return await db.insert(
+      'tbConfig',
+      config,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getAllConfigs() async {
+    final db = await database;
+    return await db.query('tbConfig');
+  }
+
+  Future<String?> getConfigValue(String key) async {
+    final db = await database;
+    final results = await db.query(
+      'tbConfig',
+      where: 'config_key = ?',
+      whereArgs: [key],
+    );
+    return results.isNotEmpty ? results.first['config_value'] as String? : null;
+  }
+
+  Future<int> updateConfig(String key, String value) async {
+    final db = await database;
+    return await db.update(
+      'tbConfig',
+      {'config_value': value},
+      where: 'config_key = ?',
+      whereArgs: [key],
+    );
+  }
+
+  // ========== STATISTICS OPERATIONS ==========
+  Future<Map<String, int>> getDefectStatistics() async {
+    final db = await database;
+    final results = await db.rawQuery('''
+      SELECT type, COUNT(*) as count 
+      FROM tbDefect 
+      GROUP BY type
+    ''');
+
+    final Map<String, int> stats = {};
+    for (var row in results) {
+      // Defensive handling: row['type'] may be null in some DB rows.
+      final key = row['type'] != null ? row['type'].toString() : 'Unknown';
+
+      // `count` should be an int, but be defensive in case it's returned as String.
+      int count = 0;
+      if (row['count'] is int) {
+        count = row['count'] as int;
+      } else if (row['count'] != null) {
+        count = int.tryParse(row['count'].toString()) ?? 0;
+      }
+
+      stats[key] = count;
+    }
+    return stats;
+  }
+
+  Future<Map<String, dynamic>> getLotStatistics(int idLot) async {
+    final db = await database;
+
+    // Get total boards for this lot
+    final totalResult = await db.rawQuery(
+      '''
+      SELECT COUNT(*) as total FROM tbBoard WHERE tbLotid_lot = ?
+    ''',
+      [idLot],
+    );
+    final total = totalResult.first['total'] as int;
+
+    // Get boards with defects (defect_quantity > 0)
+    final ngResult = await db.rawQuery(
+      '''
+      SELECT COUNT(*) as ng FROM tbBoard WHERE tbLotid_lot = ? AND defect_quantity > 0
+    ''',
+      [idLot],
+    );
+    final ng = ngResult.first['ng'] as int;
+
+    final ok = total - ng;
+    final ngRate = total > 0 ? (ng / total) * 100 : 0.0;
+
+    return {'total': total, 'ok': ok, 'ng': ng, 'ngRate': ngRate};
+  }
+
+  Future<List<Map<String, dynamic>>> getAllLotStatistics() async {
+    final db = await database;
+    return await db.rawQuery('''
+      SELECT 
+        l.id_lot,
+        l.board_quantity,
+        l.NG_rate,
+        l.fakeDef,
+        COUNT(b.id_board) as actual_boards,
+        SUM(CASE WHEN b.defect_quantity > 0 THEN 1 ELSE 0 END) as ng_boards,
+        SUM(CASE WHEN b.defect_quantity = 0 THEN 1 ELSE 0 END) as ok_boards
+      FROM tbLot l
+      LEFT JOIN tbBoard b ON l.id_lot = b.tbLotid_lot
+      GROUP BY l.id_lot
+      ORDER BY l.id_lot DESC
+    ''');
+  }
+
+  // ========== UTILITY OPERATIONS ==========
+  Future<void> clearAllTables() async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete('tbDefect');
+      await txn.delete('tbBoard');
+      await txn.delete('tbLot');
+      await txn.delete('tbModel');
+      await txn.delete('tbConfig');
+    });
+  }
+
+  Future<Map<String, dynamic>> getDatabaseInfo() async {
+    final db = await database;
+
+    final modelCount =
+        Sqflite.firstIntValue(
+          await db.rawQuery('SELECT COUNT(*) FROM tbModel'),
+        ) ??
+        0;
+    final lotCount =
+        Sqflite.firstIntValue(
+          await db.rawQuery('SELECT COUNT(*) FROM tbLot'),
+        ) ??
+        0;
+    final boardCount =
+        Sqflite.firstIntValue(
+          await db.rawQuery('SELECT COUNT(*) FROM tbBoard'),
+        ) ??
+        0;
+    final defectCount =
+        Sqflite.firstIntValue(
+          await db.rawQuery('SELECT COUNT(*) FROM tbDefect'),
+        ) ??
+        0;
+    final configCount =
+        Sqflite.firstIntValue(
+          await db.rawQuery('SELECT COUNT(*) FROM tbConfig'),
+        ) ??
+        0;
+
+    return {
+      'models': modelCount,
+      'lots': lotCount,
+      'boards': boardCount,
+      'defects': defectCount,
+      'configs': configCount,
+    };
+  }
+
+  // Close database
+  Future<void> close() async {
+    if (_db != null) {
+      await _db!.close();
+      _db = null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> getFirstLotByModelId(String idModel) async {
+    final db = await database;
+    final lots = await db.query(
+      'tbLot',
+      where: 'tbModelid_model = ?',
+      whereArgs: [idModel],
+      orderBy: 'id_lot ASC',
+    );
+    return lots.isNotEmpty ? lots.first : null;
+  }
+
+  Future<Map<String, dynamic>?> getFirstBoardByLotId(String idLot) async {
+    final db = await database;
+    final boards = await db.query(
+      'tbBoard',
+      where: 'tbLotid_lot = ?',
+      whereArgs: [idLot],
+      orderBy: 'id_board ASC',
+    );
+    return boards.isNotEmpty ? boards.first : null;
+  }
+}
