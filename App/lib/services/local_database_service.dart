@@ -223,6 +223,62 @@ class LocalDatabaseService {
         }
       }
 
+      // Kiểm tra tbBoard có cột board_code/layer_id chưa (thêm khi làm
+      // AOI_Ingest - mỗi board vật lý AOI quét ra nhiều layer, mỗi layer là
+      // 1 dòng tbBoard riêng, phân biệt bằng board_code (mã board AOI, vd
+      // "6721") + layer_id ("l1"/"l8"...). Migration này đồng bộ với
+      // AOI_Ingest/aoi_ingest_service.py::ensure_schema, vốn đã tự thêm 2
+      // cột này ở phía Python từ trước - giờ thêm nốt ở đây để Flutter cũng
+      // đọc/dùng được.
+      final boardInfoForAoi = await db.rawQuery("PRAGMA table_info(tbBoard)");
+      final boardColNamesForAoi = boardInfoForAoi
+          .map((col) => col['name'])
+          .toSet();
+
+      if (!boardColNamesForAoi.contains('board_code')) {
+        debugPrint('⚠️ Migration: Adding board_code column to tbBoard');
+        try {
+          await db.execute('ALTER TABLE tbBoard ADD COLUMN board_code TEXT');
+          debugPrint('✅ Migration completed: board_code column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add board_code to tbBoard: $e');
+        }
+      }
+      if (!boardColNamesForAoi.contains('layer_id')) {
+        debugPrint('⚠️ Migration: Adding layer_id column to tbBoard');
+        try {
+          await db.execute('ALTER TABLE tbBoard ADD COLUMN layer_id TEXT');
+          debugPrint('✅ Migration completed: layer_id column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add layer_id to tbBoard: $e');
+        }
+      }
+
+      // Kiểm tra tbBoard có cột status/completed_at chưa (cơ chế "board tiếp
+      // theo": 'pending' -> 'in_progress' -> 'completed'. SQLite tự điền giá
+      // trị DEFAULT cho các dòng đã có sẵn khi ALTER TABLE ADD COLUMN, không
+      // chỉ dòng mới, nên board cũ cũng sẽ có status='pending' sau migration).
+      if (!boardColNamesForAoi.contains('status')) {
+        debugPrint('⚠️ Migration: Adding status column to tbBoard');
+        try {
+          await db.execute(
+            "ALTER TABLE tbBoard ADD COLUMN status TEXT DEFAULT 'pending'",
+          );
+          debugPrint('✅ Migration completed: status column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add status to tbBoard: $e');
+        }
+      }
+      if (!boardColNamesForAoi.contains('completed_at')) {
+        debugPrint('⚠️ Migration: Adding completed_at column to tbBoard');
+        try {
+          await db.execute('ALTER TABLE tbBoard ADD COLUMN completed_at TEXT');
+          debugPrint('✅ Migration completed: completed_at column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add completed_at to tbBoard: $e');
+        }
+      }
+
       // Kiểm tra tbDefect có cột plc_coor chưa. Cột này lưu tọa độ đã quy đổi
       // sang hệ PLC (định dạng "x;y", ví dụ "19.887;5.86") — vrs_main_screen.dart
       // và manual_vrs_screen.dart đọc trực tiếp cột này để di chuyển camera.
@@ -351,6 +407,10 @@ class LocalDatabaseService {
         defect_quantity INTEGER,
         erro_quantity INTEGER,
         tbLotid_lot INTEGER,
+        board_code TEXT,
+        layer_id TEXT,
+        status TEXT DEFAULT 'pending',
+        completed_at TEXT,
         FOREIGN KEY (tbLotid_lot) REFERENCES tbLot(id_lot)
       )
     ''');
@@ -488,6 +548,42 @@ class LocalDatabaseService {
       'tbBoard',
       where: 'id_board = ?',
       whereArgs: [idBoard],
+    );
+    return results.isNotEmpty ? results.first : null;
+  }
+
+  /// Đánh dấu 1 board đã xử lý xong (hết lỗi, đã judgement). Dùng bởi
+  /// VRSProvider.completeCurrentBoardAndCheckNext() để biết board nào đã
+  /// xong khi tìm board tiếp theo trong cùng lot.
+  Future<int> markBoardCompleted(int idBoard) async {
+    final db = await database;
+    return await db.update(
+      'tbBoard',
+      {
+        'status': 'completed',
+        'completed_at': DateTime.now().toIso8601String(),
+      },
+      where: 'id_board = ?',
+      whereArgs: [idBoard],
+    );
+  }
+
+  /// Lấy board tiếp theo (id_board nhỏ nhất, lớn hơn [afterBoardId]) trong
+  /// cùng lot [idLot] mà chưa hoàn tất (status khác 'completed', hoặc chưa có
+  /// status - board cũ trước migration). Trả về null nếu không còn board nào
+  /// đang chờ trong lot này.
+  Future<Map<String, dynamic>?> getNextPendingBoard(
+    int idLot,
+    int afterBoardId,
+  ) async {
+    final db = await database;
+    final results = await db.query(
+      'tbBoard',
+      where:
+          'tbLotid_lot = ? AND id_board > ? AND (status IS NULL OR status != ?)',
+      whereArgs: [idLot, afterBoardId, 'completed'],
+      orderBy: 'id_board ASC',
+      limit: 1,
     );
     return results.isNotEmpty ? results.first : null;
   }
@@ -801,12 +897,18 @@ class LocalDatabaseService {
     return lots.isNotEmpty ? lots.first : null;
   }
 
+  /// Lấy board "bắt đầu/tiếp tục" cho 1 lot: board có id_board nhỏ nhất
+  /// nhưng CHƯA hoàn tất (status khác 'completed', hoặc board cũ chưa có
+  /// status). Dùng khi chọn model (setCurrentModel) và khi app khởi động
+  /// lại (_resolveFirstLotAndBoardForModel) - nếu chỉ lấy id_board nhỏ nhất
+  /// mà không lọc status, app sẽ quay lại đúng board đã xử lý xong mỗi lần
+  /// chọn lại model / mở lại app, thay vì board tiếp theo đang chờ.
   Future<Map<String, dynamic>?> getFirstBoardByLotId(String idLot) async {
     final db = await database;
     final boards = await db.query(
       'tbBoard',
-      where: 'tbLotid_lot = ?',
-      whereArgs: [idLot],
+      where: 'tbLotid_lot = ? AND (status IS NULL OR status != ?)',
+      whereArgs: [idLot, 'completed'],
       orderBy: 'id_board ASC',
     );
     return boards.isNotEmpty ? boards.first : null;

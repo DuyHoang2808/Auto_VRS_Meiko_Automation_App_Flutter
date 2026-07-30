@@ -90,14 +90,36 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
   late QCamberGerberService _gerberService;
   final bool _isLoadingGerber = false;
 
+  // Tăng lên mỗi lần _startWorkflow/_stopWorkflow được gọi, dùng làm "vé số"
+  // cho chuỗi đệ quy _inspectCurrentDefect - phát hiện khi thao tác board tự
+  // động ("Board tiếp theo") gọi _startWorkflow trong lúc 1 chuỗi cũ vẫn còn
+  // đang await (vd chờ PLC/DB) sẽ khiến 2 chuỗi cùng ghi đè _defects/_currentIndex,
+  // xử lý/lưu lỗi trùng hoặc sai board. Chuỗi cũ tự dừng ngay khi phát hiện
+  // runId không còn khớp, không cần đợi hết await mới biết.
+  int _runId = 0;
+
+  // Poll định kỳ để phát hiện board mới được AOI_Ingest (tiến trình Python
+  // độc lập) ghi thêm vào DB trong lúc không có board nào đang xử lý - trước
+  // đây không có cơ chế này nên phải thoát ra chọn lại model mới thấy board
+  // mới. Xem VRSProvider.checkForNewBoard().
+  Timer? _newBoardPollTimer;
+
   @override
   void initState() {
     super.initState();
     _gerberService = context.read<QCamberGerberService>();
+    _newBoardPollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted) return;
+      Provider.of<VRSProvider>(
+        context,
+        listen: false,
+      ).checkForNewBoard();
+    });
   }
 
   @override
   void dispose() {
+    _newBoardPollTimer?.cancel();
     // Đề phòng màn hình bị đóng giữa lúc workflow đang chạy, tránh cờ
     // "busy" bị kẹt vĩnh viễn khiến health-check không bao giờ chạy lại.
     StartupHealthCheck.setBusy(false);
@@ -137,10 +159,11 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
   /// relay: PlcGatewayService now calls `/api/inspect-defect` directly over
   /// HTTP and gets the full move+capture+AI result back in one response, so
   /// there is no separate "process" push message to wait for anymore.
-  Future<void> _inspectCurrentDefect() async {
-    if (!_running) {
+  Future<void> _inspectCurrentDefect([int? runId]) async {
+    final myRunId = runId ?? _runId;
+    if (!_running || myRunId != _runId) {
       debugPrint(
-        'VRSMainScreen: _inspectCurrentDefect called but workflow not running',
+        'VRSMainScreen: _inspectCurrentDefect called but workflow not running or stale run (myRunId=$myRunId, current=$_runId)',
       );
       return;
     }
@@ -195,7 +218,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         ),
       );
 
-      if (!mounted) return;
+      if (!mounted || myRunId != _runId) return;
 
       final result = await _plcGateway.inspectDefect(
         defectX: coords.x,
@@ -204,7 +227,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         defectId: defectId,
       );
 
-      if (!mounted) return;
+      if (!mounted || myRunId != _runId) return;
 
       if (result.imageBase64 != null && result.imageBase64!.isNotEmpty) {
         try {
@@ -251,6 +274,8 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         _lastPersistedVerdict = verdict;
         _lastPersistedType = detectedType;
       }
+
+      if (!mounted || myRunId != _runId) return;
 
       // Reload defects for the board so the list widget and index stay in sync
       final vrsProviderForReload = Provider.of<VRSProvider>(
@@ -303,8 +328,28 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       });
       StartupHealthCheck.setBusy(_running);
 
-      if (mounted && _running && _currentIndex < _defects.length) {
-        await _inspectCurrentDefect();
+      // Board vừa hết lỗi (không phải do bấm "Dừng" giữa chừng, không phải
+      // do lỗi PLC) -> đánh dấu completed + tìm board tiếp theo trong lot,
+      // để UI hiện dialog "Lật bo"/"Đặt board mới" cho vận hành viên xác nhận.
+      // Kiểm tra thêm myRunId == _runId: nếu 1 lượt chạy khác đã bắt đầu
+      // (vd bấm "Board tiếp theo" trong lúc chuỗi cũ còn đang await) thì
+      // chuỗi cũ không được phép đánh dấu board completed nữa - board đó có
+      // thể không còn là board mà lượt chạy mới đang xử lý.
+      final justFinishedBoard =
+          !_running && _defects.isNotEmpty && _currentIndex >= _defects.length;
+      if (justFinishedBoard && mounted && myRunId == _runId) {
+        final vrsProviderForNextBoard = Provider.of<VRSProvider>(
+          context,
+          listen: false,
+        );
+        await vrsProviderForNextBoard.completeCurrentBoardAndCheckNext();
+      }
+
+      if (mounted &&
+          _running &&
+          myRunId == _runId &&
+          _currentIndex < _defects.length) {
+        await _inspectCurrentDefect(myRunId);
       }
     } catch (e) {
       debugPrint('Error inspecting current defect: $e');
@@ -346,8 +391,16 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
   }
 
   Future<void> _startWorkflow(int boardId) async {
+    // Phát 1 "vé" runId mới NGAY LẬP TỨC (trước await đầu tiên) để bất kỳ
+    // chuỗi _inspectCurrentDefect cũ nào còn đang chạy (vd đang chờ PLC) sẽ
+    // tự dừng ở lần kiểm tra myRunId == _runId tiếp theo, không còn ghi đè
+    // _defects/_currentIndex của lượt chạy mới này.
+    final myRunId = ++_runId;
+
     // load defects
     final list = await LocalDatabaseService().getDefectsByBoard(boardId);
+    if (myRunId != _runId || !mounted) return; // đã có lượt chạy mới hơn khác
+
     setState(() {
       _defects = list;
       _currentIndex = 0;
@@ -359,15 +412,38 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
 
     // Inspect the first defect; this call chains through the rest via
     // _inspectCurrentDefect's own recursion, no WebSocket connection needed.
-    await _inspectCurrentDefect();
+    await _inspectCurrentDefect(myRunId);
   }
 
   Future<void> _stopWorkflow() async {
+    // Huỷ luôn runId hiện tại - chuỗi _inspectCurrentDefect đang chạy (nếu
+    // có) sẽ tự dừng ở lần kiểm tra tiếp theo, kể cả trước khi setState bên
+    // dưới kịp áp dụng.
+    _runId++;
     StartupHealthCheck.setBusy(false);
     setState(() {
       _running = false;
     });
     debugPrint('VRSMainScreen: stopped workflow');
+  }
+
+  /// Vận hành viên đã bấm "Board tiếp theo" (sau khi lật bo / đặt board mới
+  /// lên bàn) - chuyển provider sang board kế tiếp rồi tự bắt đầu workflow
+  /// luôn cho board đó, không cần bấm "Bắt đầu" thêm lần nữa.
+  Future<void> _advanceToNextBoard() async {
+    final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
+    await vrsProvider.advanceToNextBoard();
+    final newBoardId = int.tryParse(vrsProvider.currentBoard);
+    if (newBoardId != null && mounted) {
+      // Reset panel hiển thị kết quả AI của board cũ trước khi chạy board mới.
+      setState(() {
+        _lastPersistedDefectId = null;
+        _lastPersistedVerdict = null;
+        _lastPersistedType = null;
+        _lastCapturedImageBytes = null;
+      });
+      await _startWorkflow(newBoardId);
+    }
   }
 
   @override
@@ -990,6 +1066,69 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                               ),
                             ],
                           ),
+
+                          // Board hiện tại đã hết lỗi - chờ vận hành viên xác
+                          // nhận (lật bo cùng board_code khác layer, hoặc đặt
+                          // board vật lý mới lên bàn) trước khi qua board kế.
+                          if (vrsProvider.nextBoardAvailable) ...[
+                            const SizedBox(height: 16),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: Colors.blue.shade50,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: Colors.blue.shade200,
+                                ),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    vrsProvider.nextBoardIsNewPhysical
+                                        ? 'Đã xong board hiện tại. Đặt board mới lên bàn rồi bấm tiếp tục.'
+                                        : 'Đã xong board hiện tại. Lật bo rồi bấm tiếp tục.',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: Colors.blue.shade800,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  SizedBox(
+                                    width: double.infinity,
+                                    child: ElevatedButton(
+                                      onPressed: _advanceToNextBoard,
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.blue,
+                                      ),
+                                      child: const Text('Board tiếp theo'),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ] else if (vrsProvider.lotFinished) ...[
+                            const SizedBox(height: 16),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: Colors.green.shade50,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                vrsProvider.lastCompletedBoardId.isNotEmpty
+                                    ? 'Đã hoàn tất board cuối cùng (Board #${vrsProvider.lastCompletedBoardId}). '
+                                          'Không còn board nào khác trong lô này.'
+                                    : 'Đã hoàn tất toàn bộ board trong lô này.',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: Colors.green.shade800,
+                                ),
+                              ),
+                            ),
+                          ],
 
                           const SizedBox(height: 16),
 

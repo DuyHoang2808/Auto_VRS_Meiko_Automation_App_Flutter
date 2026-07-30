@@ -15,6 +15,16 @@ class VRSProvider extends ChangeNotifier {
   int _okCount = 0;
   int _ngCount = 0;
 
+  // "Board tiếp theo" - xem completeCurrentBoardAndCheckNext()/advanceToNextBoard()
+  bool _nextBoardAvailable = false;
+  bool _nextBoardIsNewPhysical = false;
+  String _nextBoardId = '';
+  bool _lotFinished = false;
+  // Board cuối cùng vừa hoàn tất khi không còn board nào khác trong lot -
+  // giữ lại chỉ để hiển thị thông báo rõ ràng, KHÔNG dùng làm currentBoard
+  // nữa (currentBoard phải reset về 'Chưa có', xem completeCurrentBoardAndCheckNext).
+  String _lastCompletedBoardId = '';
+
   // Camera and alignment settings
   double _magnification = 140.0;
   double _lightLevel = 50.0;
@@ -41,6 +51,10 @@ class VRSProvider extends ChangeNotifier {
       List.unmodifiable(_alignmentPoints);
   int get currentAlignmentStep => _currentAlignmentStep;
   bool get isInitialized => _isInitialized;
+  bool get nextBoardAvailable => _nextBoardAvailable;
+  bool get nextBoardIsNewPhysical => _nextBoardIsNewPhysical;
+  bool get lotFinished => _lotFinished;
+  String get lastCompletedBoardId => _lastCompletedBoardId;
 
   // Initialize provider with database data
   Future<void> initialize() async {
@@ -162,6 +176,110 @@ class VRSProvider extends ChangeNotifier {
 
     final board = await _db.getFirstBoardByLotId(_currentLot);
     _currentBoard = board != null ? board['id_board'].toString() : 'Chưa có';
+  }
+
+  /// Gọi khi workflow tự động đã chạy hết toàn bộ lỗi của board hiện tại.
+  /// Đánh dấu board đó `completed`, rồi tìm board tiếp theo (id_board nhỏ
+  /// nhất, lớn hơn board hiện tại) còn `pending` trong cùng lot.
+  ///
+  /// Không tự chuyển sang board mới ở đây - chỉ cập nhật state để UI hiện
+  /// dialog/nút "Board tiếp theo" cho vận hành viên xác nhận trước (khớp
+  /// quy trình thật: cần lật bo hoặc đặt board mới lên bàn, là thao tác tay).
+  /// Gọi [advanceToNextBoard] sau khi vận hành viên xác nhận.
+  Future<void> completeCurrentBoardAndCheckNext() async {
+    final boardId = int.tryParse(_currentBoard);
+    final lotId = int.tryParse(_currentLot);
+    if (boardId == null || lotId == null) return;
+
+    try {
+      final currentBoardRow = await _db.getBoardById(boardId);
+      await _db.markBoardCompleted(boardId);
+
+      final nextBoardRow = await _db.getNextPendingBoard(lotId, boardId);
+
+      if (nextBoardRow != null) {
+        final currentCode = currentBoardRow?['board_code']?.toString();
+        final nextCode = nextBoardRow['board_code']?.toString();
+        // Không xác định được board_code (dữ liệu cũ trước AOI_Ingest) ->
+        // mặc định coi là board vật lý mới để an toàn hơn (nhắc đặt board
+        // mới thay vì chỉ lật bo).
+        _nextBoardIsNewPhysical =
+            currentCode == null || nextCode == null || currentCode != nextCode;
+        _nextBoardId = nextBoardRow['id_board'].toString();
+        _nextBoardAvailable = true;
+        _lotFinished = false;
+        _lastCompletedBoardId = '';
+      } else {
+        // Không còn board nào khác trong lot - đây là board cuối cùng.
+        // Reset currentBoard về 'Chưa có' để UI không tiếp tục hiển thị board
+        // đã xong như thể vẫn đang là board hiện tại (bug đã gặp: boardText
+        // vẫn giữ nguyên id board cũ, nút "Bắt đầu" vẫn bật lại được và chạy
+        // lại đúng board vừa xong nếu bấm nhầm).
+        _lastCompletedBoardId = _currentBoard;
+        _currentBoard = 'Chưa có';
+        _nextBoardAvailable = false;
+        _nextBoardId = '';
+        _lotFinished = true;
+      }
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error completing board / checking next board: $e');
+    }
+  }
+
+  /// Gọi định kỳ (polling) từ màn hình VRS trong lúc KHÔNG có board đang xử
+  /// lý (`currentBoard == 'Chưa có'` - do lot vừa hoàn tất hoặc do chưa có
+  /// board nào tới). DB `autovrs.db` có thể được `AOI_Ingest` (tiến trình
+  /// Python độc lập, chạy song song, không qua app) ghi thêm board mới vào
+  /// bất kỳ lúc nào - trước đây app không có cơ chế nào tự phát hiện việc
+  /// này, vận hành viên phải tự thoát ra chọn lại model mới thấy board mới.
+  ///
+  /// Không tự động chạy ngay khi tìm thấy board mới - chỉ chuyển sang trạng
+  /// thái "board tiếp theo" (giống hệt [completeCurrentBoardAndCheckNext])
+  /// để vận hành viên xác nhận trước (đặt board mới lên bàn / lật bo).
+  Future<void> checkForNewBoard() async {
+    // Đã có board đang xử lý hoặc đã tìm thấy board chờ xác nhận - không cần
+    // check lại, tránh query DB thừa mỗi lần timer chạy.
+    if (_currentBoard.isNotEmpty && _currentBoard != 'Chưa có') return;
+    if (_nextBoardAvailable) return;
+    if (_currentLot.isEmpty || _currentLot == 'Chưa có') return;
+
+    try {
+      final nextBoardRow = await _db.getFirstBoardByLotId(_currentLot);
+      if (nextBoardRow == null) return; // vẫn chưa có board mới nào
+
+      Map<String, dynamic>? lastCompletedBoardRow;
+      final lastId = int.tryParse(_lastCompletedBoardId);
+      if (lastId != null) {
+        lastCompletedBoardRow = await _db.getBoardById(lastId);
+      }
+
+      final currentCode = lastCompletedBoardRow?['board_code']?.toString();
+      final nextCode = nextBoardRow['board_code']?.toString();
+      _nextBoardIsNewPhysical =
+          currentCode == null || nextCode == null || currentCode != nextCode;
+      _nextBoardId = nextBoardRow['id_board'].toString();
+      _nextBoardAvailable = true;
+      _lotFinished = false;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error checking for newly ingested board: $e');
+    }
+  }
+
+  /// Vận hành viên đã xác nhận (lật bo / đặt board mới lên bàn) - chuyển
+  /// `currentBoard` sang board tiếp theo đã tìm thấy ở
+  /// [completeCurrentBoardAndCheckNext]. Không tự bắt đầu workflow - màn
+  /// hình gọi hàm này rồi tự gọi `_startWorkflow` với board mới.
+  Future<void> advanceToNextBoard() async {
+    if (!_nextBoardAvailable || _nextBoardId.isEmpty) return;
+    _currentBoard = _nextBoardId;
+    _nextBoardAvailable = false;
+    _nextBoardIsNewPhysical = false;
+    _nextBoardId = '';
+    _lotFinished = false;
+    _lastCompletedBoardId = '';
+    notifyListeners();
   }
 
   Future<void> updateCounts({int? total, int? ok, int? ng}) async {
