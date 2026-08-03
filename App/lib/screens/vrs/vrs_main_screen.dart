@@ -74,6 +74,7 @@ class VRSMainScreen extends StatefulWidget {
 class _VRSMainScreenState extends State<VRSMainScreen> {
   final PlcGatewayService _plcGateway = PlcGatewayService();
   bool _running = false;
+  bool _calibrating = false;
   List<Map<String, dynamic>> _defects = [];
   int _currentIndex = 0;
   // Token to force defect list widget to reload its cached future
@@ -427,10 +428,202 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     debugPrint('VRSMainScreen: stopped workflow');
   }
 
+  /// Hiện dialog kết quả calib thành công, chờ operator xác nhận tiếp tục.
+  /// Trả `true` nếu bấm "Tiếp tục", `false` nếu bấm "Hủy".
+  Future<bool> _showCalibSuccessDialog(AutoBoardOffsetResponse result) async {
+    final hasWarning = result.warning != null;
+    final action = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(
+              hasWarning ? Icons.warning_amber_rounded : Icons.check_circle,
+              color: hasWarning ? Colors.orange : Colors.green,
+            ),
+            const SizedBox(width: 8),
+            Text(hasWarning
+                ? 'Calib thành công (có cảnh báo)'
+                : 'Calib bù lệch thành công'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Góc lệch (θ): ${result.thetaDeg?.toStringAsFixed(4)}°'),
+            Text('Dịch X (tx): ${result.tx?.toStringAsFixed(4)} mm'),
+            Text('Dịch Y (ty): ${result.ty?.toStringAsFixed(4)} mm'),
+            Text('Sai số RMS: ${result.rmsErrorMm?.toStringAsFixed(4)} mm'),
+            if (hasWarning) ...[
+              const SizedBox(height: 12),
+              Text(
+                result.warning!,
+                style: const TextStyle(color: Colors.orange, fontSize: 13),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
+            child: const Text('Hủy'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, 'continue'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+            child: const Text('Tiếp tục'),
+          ),
+        ],
+      ),
+    );
+    return action == 'continue';
+  }
+
+  /// Chạy auto board offset calibration nếu provider báo cần (board mới hoặc
+  /// đổi mặt A↔B). Trả `true` nếu OK (hoặc user chọn bỏ qua), `false` nếu
+  /// user chọn Hủy (không advance sang board mới).
+  Future<bool> _runCalibrationIfNeeded() async {
+    final vrs = Provider.of<VRSProvider>(context, listen: false);
+    if (!vrs.calibrationNeeded) return true;
+
+    setState(() => _calibrating = true);
+
+    // boardId là metadata tùy chọn (ghi vào offset_runtime.json để truy vết),
+    // gateway vẫn calib đúng dù không truyền.
+    final result = await _plcGateway.triggerAutoBoardOffset(
+      boardSide: vrs.nextBoardSide,
+    );
+
+    if (!mounted) return false;
+    setState(() => _calibrating = false);
+
+    if (result.success) {
+      debugPrint(
+        '📐 Calib OK: θ=${result.thetaDeg?.toStringAsFixed(4)}° '
+        'tx=${result.tx?.toStringAsFixed(4)} ty=${result.ty?.toStringAsFixed(4)} '
+        'RMS=${result.rmsErrorMm?.toStringAsFixed(4)}mm',
+      );
+      if (!mounted) return false;
+      // Hiện kết quả calib, chờ operator xác nhận
+      return await _showCalibSuccessDialog(result);
+    }
+
+    // Calib thất bại → dialog cho user chọn
+    final action = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Calib bù lệch thất bại'),
+        content: Text(
+          '${result.message}\n\n'
+          'Thử lại, bỏ qua (dùng tọa độ gốc không bù), hoặc hủy?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
+            child: const Text('Hủy'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'skip'),
+            child: const Text('Bỏ qua'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, 'retry'),
+            child: const Text('Thử lại'),
+          ),
+        ],
+      ),
+    );
+
+    if (action == 'retry') return _runCalibrationIfNeeded();
+    if (action == 'skip') return true;
+    return false; // cancel
+  }
+
+  /// Bấm "Bắt đầu" — calib bù lệch board trước rồi mới chạy workflow.
+  /// Luôn calib khi bắt đầu board mới (board đầu tiên hoặc board bất kỳ khi
+  /// operator bấm Start thủ công) vì board vừa được đặt/lật lên bàn.
+  Future<void> _startWithCalibration(int boardId) async {
+    // Đọc board row để xác định layer_id → board side
+    final db = LocalDatabaseService();
+    final boardRow = await db.getBoardById(boardId);
+    final layerId = boardRow?['layer_id']?.toString();
+    final side = VRSProvider.boardSideFromLayerId(layerId);
+
+    // Cập nhật currentBoardSide trên provider (lần đầu chưa set)
+    final vrs = Provider.of<VRSProvider>(context, listen: false);
+    // Provider chưa expose setter trực tiếp → ta calib với side vừa tính,
+    // rồi advanceToNextBoard sẽ sync lại khi chuyển board sau này.
+
+    setState(() => _calibrating = true);
+
+    final result = await _plcGateway.triggerAutoBoardOffset(
+      boardSide: side,
+    );
+
+    if (!mounted) return;
+    setState(() => _calibrating = false);
+
+    if (result.success) {
+      debugPrint(
+        '📐 Calib OK (start): θ=${result.thetaDeg?.toStringAsFixed(4)}° '
+        'tx=${result.tx?.toStringAsFixed(4)} ty=${result.ty?.toStringAsFixed(4)} '
+        'RMS=${result.rmsErrorMm?.toStringAsFixed(4)}mm',
+      );
+      if (!mounted) return;
+      // Hiện kết quả calib, chờ operator xác nhận trước khi chạy workflow
+      final proceed = await _showCalibSuccessDialog(result);
+      if (proceed && mounted) {
+        await _startWorkflow(boardId);
+      }
+      return;
+    }
+
+    // Calib thất bại → dialog
+    final action = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Calib bù lệch thất bại'),
+        content: Text(
+          '${result.message}\n\n'
+          'Thử lại, bỏ qua (dùng tọa độ gốc không bù), hoặc hủy?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
+            child: const Text('Hủy'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'skip'),
+            child: const Text('Bỏ qua'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, 'retry'),
+            child: const Text('Thử lại'),
+          ),
+        ],
+      ),
+    );
+
+    if (action == 'retry') {
+      await _startWithCalibration(boardId);
+    } else if (action == 'skip') {
+      await _startWorkflow(boardId);
+    }
+    // cancel → không làm gì
+  }
+
   /// Vận hành viên đã bấm "Board tiếp theo" (sau khi lật bo / đặt board mới
-  /// lên bàn) - chuyển provider sang board kế tiếp rồi tự bắt đầu workflow
-  /// luôn cho board đó, không cần bấm "Bắt đầu" thêm lần nữa.
+  /// lên bàn) - chạy calib bù lệch nếu cần, rồi chuyển provider sang board
+  /// kế tiếp và tự bắt đầu workflow luôn.
   Future<void> _advanceToNextBoard() async {
+    // Chạy auto board offset calibration trước khi advance
+    final proceed = await _runCalibrationIfNeeded();
+    if (!proceed || !mounted) return;
+
     final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
     await vrsProvider.advanceToNextBoard();
     final newBoardId = int.tryParse(vrsProvider.currentBoard);
@@ -1042,16 +1235,32 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                               Expanded(
                                 child: ElevatedButton(
                                   onPressed:
-                                      (boardText != 'Chưa có' && !_running)
+                                      (boardText != 'Chưa có' && !_running && !_calibrating)
                                       ? () {
                                           final bId = int.tryParse(boardText);
-                                          if (bId != null) _startWorkflow(bId);
+                                          if (bId != null) _startWithCalibration(bId);
                                         }
                                       : null,
                                   style: ElevatedButton.styleFrom(
                                     backgroundColor: Colors.green,
                                   ),
-                                  child: const Text('Bắt đầu'),
+                                  child: _calibrating
+                                      ? const Row(
+                                          mainAxisAlignment: MainAxisAlignment.center,
+                                          children: [
+                                            SizedBox(
+                                              height: 16,
+                                              width: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                            SizedBox(width: 8),
+                                            Text('Đang calib...'),
+                                          ],
+                                        )
+                                      : const Text('Bắt đầu'),
                                 ),
                               ),
                               const SizedBox(width: 12),
@@ -1094,16 +1303,49 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                                       color: Colors.blue.shade800,
                                     ),
                                   ),
+                                  // Thông báo sẽ tự động calib nếu cần
+                                  if (vrsProvider.calibrationNeeded) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      '⚙️ Sẽ tự động calib bù lệch board '
+                                      '(mặt ${vrsProvider.nextBoardSide})',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: Colors.blue.shade600,
+                                        fontStyle: FontStyle.italic,
+                                      ),
+                                    ),
+                                  ],
                                   const SizedBox(height: 10),
                                   SizedBox(
                                     width: double.infinity,
-                                    child: ElevatedButton(
-                                      onPressed: _advanceToNextBoard,
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: Colors.blue,
-                                      ),
-                                      child: const Text('Board tiếp theo'),
-                                    ),
+                                    child: _calibrating
+                                        ? Column(
+                                            children: [
+                                              const SizedBox(
+                                                height: 24,
+                                                width: 24,
+                                                child: CircularProgressIndicator(
+                                                  strokeWidth: 2.5,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 8),
+                                              Text(
+                                                'Đang calib bù lệch board...',
+                                                style: TextStyle(
+                                                  fontSize: 12,
+                                                  color: Colors.blue.shade700,
+                                                ),
+                                              ),
+                                            ],
+                                          )
+                                        : ElevatedButton(
+                                            onPressed: _advanceToNextBoard,
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: Colors.blue,
+                                            ),
+                                            child: const Text('Board tiếp theo'),
+                                          ),
                                   ),
                                 ],
                               ),

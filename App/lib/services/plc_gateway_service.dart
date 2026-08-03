@@ -173,6 +173,70 @@ class PlcGatewayService {
     }
   }
 
+  /// Trigger auto board offset calibration (YOLO fiducial detection + Kabsch)
+  ///
+  /// Gọi khi: đổi board vật lý mới hoặc đổi mặt board (A↔B).
+  /// PLC sẽ di chuyển đến các điểm mốc, camera chụp, YOLO detect marker,
+  /// tính Kabsch rigid transform, lưu offset_runtime.json.
+  /// Timeout 90s vì PLC cần di chuyển tới 2-3 điểm mốc + chụp + detect.
+  Future<AutoBoardOffsetResponse> triggerAutoBoardOffset({
+    required String boardSide,
+    String? boardId,
+    int anchorMode = 2,
+  }) async {
+    try {
+      print('📐 Triggering auto board offset: side=$boardSide boardId=$boardId anchorMode=$anchorMode');
+
+      final requestBody = {
+        'anchor_mode': anchorMode,
+        'board_side': boardSide,
+        if (boardId != null) 'board_id': boardId,
+      };
+
+      final response = await http
+          .post(
+            Uri.parse('$_resolvedBaseUrl/api/calib/auto-board-offset'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode(requestBody),
+          )
+          .timeout(const Duration(seconds: 90));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        print('✅ Auto board offset: ${data['message']}');
+        return AutoBoardOffsetResponse.fromJson(data);
+      } else {
+        String detail = 'HTTP ${response.statusCode}';
+        try {
+          final decoded = json.decode(response.body);
+          if (decoded is Map && decoded['detail'] != null) {
+            detail = decoded['detail'].toString();
+          }
+        } catch (_) {}
+        return AutoBoardOffsetResponse(success: false, message: detail);
+      }
+    } catch (e) {
+      print('❌ Auto board offset error: $e');
+      return AutoBoardOffsetResponse(success: false, message: 'Error: $e');
+    }
+  }
+
+  /// Get current offset status (offset_runtime.json contents)
+  Future<Map<String, dynamic>> getOffsetStatus() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$_resolvedBaseUrl/api/calib/offset-status'))
+          .timeout(const Duration(seconds: 5));
+
+      if (response.statusCode == 200) {
+        return json.decode(response.body);
+      }
+      return {'success': false, 'message': 'HTTP ${response.statusCode}'};
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
   /// Check if PLC Gateway API is running
   Future<bool> isApiAvailable() async {
     try {
@@ -181,6 +245,26 @@ class PlcGatewayService {
           .timeout(const Duration(seconds: 2));
 
       return response.statusCode == 200;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Check if Fiducial Detector Service (YOLO) is running.
+  /// Gọi trực tiếp Fiducial Service (port 8191) thay vì qua gateway,
+  /// vì gateway có thể UP nhưng fiducial service chưa khởi động.
+  static Future<bool> checkFiducialHealth({String? baseUrl}) async {
+    try {
+      final url = baseUrl ??
+          AppRuntimeConfig.instance.fiducialDetectorBaseUrl;
+      final response = await http
+          .get(Uri.parse('$url/'))
+          .timeout(const Duration(seconds: 3));
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return data['status'] == 'running';
+      }
+      return false;
     } catch (e) {
       return false;
     }
@@ -274,4 +358,52 @@ class InspectDefectResponse {
   bool get isOk => aiVerdict == 'OK';
 
   double? get totalTime => timing?['total'];
+}
+
+/// Response from /api/calib/auto-board-offset endpoint
+class AutoBoardOffsetResponse {
+  final bool success;
+  final String message;
+  final int? anchorMode;
+  final double? thetaDeg;
+  final double? tx;
+  final double? ty;
+  final double? rmsErrorMm;
+  final double? maxErrorMm;
+  final String? warning;
+  final String? boardId;
+  final String? boardSide;
+  final Map<String, dynamic>? timing;
+
+  AutoBoardOffsetResponse({
+    required this.success,
+    required this.message,
+    this.anchorMode,
+    this.thetaDeg,
+    this.tx,
+    this.ty,
+    this.rmsErrorMm,
+    this.maxErrorMm,
+    this.warning,
+    this.boardId,
+    this.boardSide,
+    this.timing,
+  });
+
+  factory AutoBoardOffsetResponse.fromJson(Map<String, dynamic> json) {
+    return AutoBoardOffsetResponse(
+      success: json['success'] ?? false,
+      message: json['message'] ?? '',
+      anchorMode: json['anchor_mode'] as int?,
+      thetaDeg: (json['theta_deg'] as num?)?.toDouble(),
+      tx: (json['tx'] as num?)?.toDouble(),
+      ty: (json['ty'] as num?)?.toDouble(),
+      rmsErrorMm: (json['rms_error_mm'] as num?)?.toDouble(),
+      maxErrorMm: (json['max_error_mm'] as num?)?.toDouble(),
+      warning: json['warning'] as String?,
+      boardId: json['board_id'] as String?,
+      boardSide: json['board_side'] as String?,
+      timing: json['timing'] as Map<String, dynamic>?,
+    );
+  }
 }

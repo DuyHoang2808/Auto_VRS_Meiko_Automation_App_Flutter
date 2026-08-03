@@ -44,6 +44,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
 
   // Camera movement state
   bool _isSendingCoords = false;
+  // Auto board offset calibration
+  bool _calibrating = false;
 
   // Capture state management
   bool _isAnalyzing = false;
@@ -321,6 +323,42 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
         );
       }
       debugPrint('❌ Error sending coordinates: $e');
+    }
+  }
+
+  /// Calib bù lệch thủ công — operator bấm khi muốn re-calib board hiện tại.
+  Future<void> _triggerManualCalibration() async {
+    final vrs = Provider.of<VRSProvider>(context, listen: false);
+    setState(() => _calibrating = true);
+
+    final result = await _plcGateway.triggerAutoBoardOffset(
+      boardSide: vrs.currentBoardSide,
+    );
+
+    if (!mounted) return;
+    setState(() => _calibrating = false);
+
+    if (result.success) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Calib OK: θ=${result.thetaDeg?.toStringAsFixed(4)}° '
+            'tx=${result.tx?.toStringAsFixed(4)} ty=${result.ty?.toStringAsFixed(4)} '
+            'RMS=${result.rmsErrorMm?.toStringAsFixed(4)}mm'
+            '${result.warning != null ? " ⚠️" : ""}',
+          ),
+          backgroundColor: result.warning != null ? Colors.orange : Colors.green,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Calib thất bại: ${result.message}'),
+          backgroundColor: Colors.red,
+          duration: const Duration(seconds: 4),
+        ),
+      );
     }
   }
 
@@ -1141,6 +1179,41 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                   vrsProvider.currentBoard.isNotEmpty
                                       ? vrsProvider.currentBoard
                                       : 'Chưa có',
+                                ),
+                                const SizedBox(height: 12),
+                                _buildInfoRow(
+                                  'Mặt board:',
+                                  'Mặt ${vrsProvider.currentBoardSide}'
+                                  '${vrsProvider.currentBoardSide == "A" ? " (Top)" : " (Bot)"}',
+                                ),
+                                const SizedBox(height: 8),
+                                // Nút calib bù lệch thủ công
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: _calibrating
+                                      ? const Padding(
+                                          padding: EdgeInsets.symmetric(vertical: 8),
+                                          child: Center(
+                                            child: SizedBox(
+                                              height: 20,
+                                              width: 20,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            ),
+                                          ),
+                                        )
+                                      : OutlinedButton.icon(
+                                          onPressed: _triggerManualCalibration,
+                                          icon: const Icon(Icons.settings, size: 16),
+                                          label: const Text('Calib bù lệch board'),
+                                          style: OutlinedButton.styleFrom(
+                                            padding: const EdgeInsets.symmetric(
+                                              vertical: 8,
+                                            ),
+                                            textStyle: const TextStyle(fontSize: 12),
+                                          ),
+                                        ),
                                 ),
                                 const SizedBox(height: 12),
                                 _buildInfoRow(

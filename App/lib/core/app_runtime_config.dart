@@ -18,6 +18,7 @@ class AppRuntimeConfig extends ChangeNotifier {
   static const String aiBaseUrlKey = 'ai_base_url';
   static const String qcamberBaseUrlKey = 'qcamber_base_url';
   static const String plcGatewayBaseUrlKey = 'plc_gateway_base_url';
+  static const String fiducialDetectorBaseUrlKey = 'fiducial_detector_base_url';
   static const String ffmpegPathKey = 'ffmpeg_path';
   static const String rtspFpsKey = 'rtsp_fps';
 
@@ -31,6 +32,7 @@ class AppRuntimeConfig extends ChangeNotifier {
     aiBaseUrlKey: 'http://localhost:8082',
     qcamberBaseUrlKey: 'http://localhost:8686',
     plcGatewayBaseUrlKey: 'http://localhost:8083',
+    fiducialDetectorBaseUrlKey: 'http://127.0.0.1:8191',
     ffmpegPathKey: 'ffmpeg',
     rtspFpsKey: '15',
   };
@@ -51,6 +53,7 @@ class AppRuntimeConfig extends ChangeNotifier {
   String get aiBaseUrl => getString(aiBaseUrlKey);
   String get qcamberBaseUrl => getString(qcamberBaseUrlKey);
   String get plcGatewayBaseUrl => getString(plcGatewayBaseUrlKey);
+  String get fiducialDetectorBaseUrl => getString(fiducialDetectorBaseUrlKey);
   String get ffmpegPath => getString(ffmpegPathKey);
   int get rtspFps => int.tryParse(getString(rtspFpsKey)) ?? 15;
 

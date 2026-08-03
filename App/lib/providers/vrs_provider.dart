@@ -20,6 +20,12 @@ class VRSProvider extends ChangeNotifier {
   bool _nextBoardIsNewPhysical = false;
   String _nextBoardId = '';
   bool _lotFinished = false;
+
+  // Board side tracking + calibration flag
+  // "A" = mặt top (l1-l4), "B" = mặt bottom (l5-l8)
+  String _currentBoardSide = 'A';
+  String _nextBoardSide = 'A';
+  bool _calibrationNeeded = false;
   // Board cuối cùng vừa hoàn tất khi không còn board nào khác trong lot -
   // giữ lại chỉ để hiển thị thông báo rõ ràng, KHÔNG dùng làm currentBoard
   // nữa (currentBoard phải reset về 'Chưa có', xem completeCurrentBoardAndCheckNext).
@@ -55,6 +61,20 @@ class VRSProvider extends ChangeNotifier {
   bool get nextBoardIsNewPhysical => _nextBoardIsNewPhysical;
   bool get lotFinished => _lotFinished;
   String get lastCompletedBoardId => _lastCompletedBoardId;
+  String get currentBoardSide => _currentBoardSide;
+  String get nextBoardSide => _nextBoardSide;
+  bool get calibrationNeeded => _calibrationNeeded;
+
+  /// Xác định mặt board từ layer_id: l1-l4 → "A" (top), l5-l8 → "B" (bottom).
+  /// Format layer_id từ AOI_Ingest: lowercase "l1", "l2", ..., "l8".
+  /// Trả "A" nếu không parse được (an toàn hơn).
+  static String boardSideFromLayerId(String? layerId) {
+    if (layerId == null || layerId.isEmpty) return 'A';
+    // Bỏ prefix "l"/"L", parse số
+    final numeric = int.tryParse(layerId.replaceFirst(RegExp(r'^[lL]'), ''));
+    if (numeric == null) return 'A';
+    return numeric >= 5 ? 'B' : 'A';
+  }
 
   // Initialize provider with database data
   Future<void> initialize() async {
@@ -209,6 +229,14 @@ class VRSProvider extends ChangeNotifier {
         _nextBoardAvailable = true;
         _lotFinished = false;
         _lastCompletedBoardId = '';
+
+        // Xác định mặt board tiếp theo + cần calib hay không
+        final currentLayerId = currentBoardRow?['layer_id']?.toString();
+        final nextLayerId = nextBoardRow['layer_id']?.toString();
+        _nextBoardSide = boardSideFromLayerId(nextLayerId);
+        // Cần calib nếu: board vật lý mới HOẶC đổi mặt (A↔B)
+        _calibrationNeeded = _nextBoardIsNewPhysical ||
+            boardSideFromLayerId(currentLayerId) != _nextBoardSide;
       } else {
         // Không còn board nào khác trong lot - đây là board cuối cùng.
         // Reset currentBoard về 'Chưa có' để UI không tiếp tục hiển thị board
@@ -261,6 +289,14 @@ class VRSProvider extends ChangeNotifier {
       _nextBoardId = nextBoardRow['id_board'].toString();
       _nextBoardAvailable = true;
       _lotFinished = false;
+
+      // Xác định mặt board + cần calib
+      final lastLayerId = lastCompletedBoardRow?['layer_id']?.toString();
+      final nextLayerId = nextBoardRow['layer_id']?.toString();
+      _nextBoardSide = boardSideFromLayerId(nextLayerId);
+      _calibrationNeeded = _nextBoardIsNewPhysical ||
+          boardSideFromLayerId(lastLayerId) != _nextBoardSide;
+
       notifyListeners();
     } catch (e) {
       debugPrint('Error checking for newly ingested board: $e');
@@ -274,11 +310,13 @@ class VRSProvider extends ChangeNotifier {
   Future<void> advanceToNextBoard() async {
     if (!_nextBoardAvailable || _nextBoardId.isEmpty) return;
     _currentBoard = _nextBoardId;
+    _currentBoardSide = _nextBoardSide;
     _nextBoardAvailable = false;
     _nextBoardIsNewPhysical = false;
     _nextBoardId = '';
     _lotFinished = false;
     _lastCompletedBoardId = '';
+    _calibrationNeeded = false;
     notifyListeners();
   }
 

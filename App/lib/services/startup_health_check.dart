@@ -43,7 +43,7 @@ class StartupHealthCheck {
   static bool _isFirstTick = true;
   static bool _busy = false;
 
-  /// Kiểm tra 1 lần, trả về kết quả của cả 3 dịch vụ (không in log, không
+  /// Kiểm tra 1 lần, trả về kết quả của cả 4 dịch vụ (không in log, không
   /// ảnh hưởng lịch trình theo dõi định kỳ).
   static Future<List<ApiStatus>> run() async {
     final config = AppRuntimeConfig.instance;
@@ -58,6 +58,9 @@ class StartupHealthCheck {
       _aiDetection
           .checkServerHealth()
           .then((up) => ApiStatus('AI Detection', config.aiBaseUrl, up)),
+      PlcGatewayService.checkFiducialHealth()
+          .then((up) => ApiStatus(
+                'Fiducial YOLO', config.fiducialDetectorBaseUrl, up)),
     ]);
   }
 
