@@ -48,6 +48,10 @@ class _RuntimeEndpointConfigDialogState
     _ConfigField(AppRuntimeConfig.coordWsUrlKey, 'Coordinator WebSocket'),
     _ConfigField(AppRuntimeConfig.aiBaseUrlKey, 'AI Base URL'),
     _ConfigField(AppRuntimeConfig.plcGatewayBaseUrlKey, 'PLC Gateway Base URL'),
+    _ConfigField(
+      AppRuntimeConfig.fiducialDetectorBaseUrlKey,
+      'Fiducial YOLO Base URL',
+    ),
     _ConfigField(AppRuntimeConfig.qcamberBaseUrlKey, 'QCamber Base URL'),
     _ConfigField(AppRuntimeConfig.videoFrameWsUrlKey, 'Video Frame WebSocket'),
     _ConfigField(AppRuntimeConfig.cameraWsUrlKey, 'Camera Backend WebSocket'),
@@ -150,6 +154,7 @@ class _RuntimeEndpointConfigDialogState
       AppRuntimeConfig.coordWsUrlKey,
       AppRuntimeConfig.aiBaseUrlKey,
       AppRuntimeConfig.plcGatewayBaseUrlKey,
+      AppRuntimeConfig.fiducialDetectorBaseUrlKey,
       AppRuntimeConfig.qcamberBaseUrlKey,
       AppRuntimeConfig.videoFrameWsUrlKey,
       AppRuntimeConfig.cameraWsUrlKey,
@@ -176,6 +181,7 @@ class _RuntimeEndpointConfigDialogState
       AppRuntimeConfig.autoVrsRtspUrlKey: ['rtsp'],
       AppRuntimeConfig.aiBaseUrlKey: ['http', 'https'],
       AppRuntimeConfig.plcGatewayBaseUrlKey: ['http', 'https'],
+      AppRuntimeConfig.fiducialDetectorBaseUrlKey: ['http', 'https'],
       AppRuntimeConfig.qcamberBaseUrlKey: ['http', 'https'],
       AppRuntimeConfig.apiBaseUrlKey: ['http', 'https'],
     };

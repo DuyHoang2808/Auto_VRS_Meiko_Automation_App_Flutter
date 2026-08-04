@@ -1760,7 +1760,7 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
         modelName: model['name'] ?? 'Model_${model['id_model']}',
         coordinates: coordinates,
         defectType: defect['type'],
-        layerName: 'l8', // Changed from l2 to l1
+        layerName: board['layer_id']?.toString() ?? 'l8',
         zoom: 8192.0,
       );
 

@@ -12,11 +12,18 @@ class DefectListWidget extends StatefulWidget {
   /// its cached Future from the database. Increment this to refresh.
   final int reloadToken;
 
+  /// id_defect của lỗi đang được xử lý (PLC di chuyển/chụp/AI) ngay lúc
+  /// này, nếu có - hiện chấm màu xanh dương cho lỗi này, bất kể judgement
+  /// đã lưu trong DB là gì (đang xử lý lại/soi lại thì vẫn ưu tiên hiện
+  /// "đang xử lý" hơn là kết quả cũ).
+  final int? processingDefectId;
+
   const DefectListWidget({
     super.key,
     required this.boardId,
     this.height = 220,
     this.reloadToken = 0,
+    this.processingDefectId,
   });
 
   @override
@@ -141,10 +148,29 @@ class _DefectListWidgetState extends State<DefectListWidget> {
               final judgement = (d['judgement'] ?? 'Chua xac dinh').toString();
               final time = (d['time'] ?? '').toString();
               final coords = (d['coordinates'] ?? '').toString();
+              final defectId = d['id_defect'];
+              final isProcessing = widget.processingDefectId != null &&
+                  defectId == widget.processingDefectId;
+              final statusColor = isProcessing
+                  ? Colors.blue
+                  : judgement.toUpperCase() == 'OK'
+                      ? Colors.green
+                      : judgement.toUpperCase() == 'NG'
+                          ? Colors.red
+                          : colorScheme.outlineVariant;
 
               return ListTile(
                 dense: true,
                 visualDensity: VisualDensity.compact,
+                leading: Container(
+                  width: 12,
+                  height: 12,
+                  margin: const EdgeInsets.only(top: 4),
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    shape: BoxShape.circle,
+                  ),
+                ),
                 title: Text(_getDefectDisplayName(type)),
                 subtitle: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,

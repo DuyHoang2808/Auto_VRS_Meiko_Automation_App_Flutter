@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:autovrs_app/core/feather_icons.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
+import '../../main.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/vrs_provider.dart';
 // import '../../services/autovrs_websocket_service.dart';
@@ -75,10 +76,14 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
   final PlcGatewayService _plcGateway = PlcGatewayService();
   bool _running = false;
   bool _calibrating = false;
+  bool _checkingNewBoard = false;
   List<Map<String, dynamic>> _defects = [];
   int _currentIndex = 0;
   // Token to force defect list widget to reload its cached future
   int _defectListReloadToken = 0;
+  // id_defect đang được PLC/AI xử lý ngay lúc này (hiện chấm màu xanh dương
+  // trên DefectListWidget) - null khi không có gì đang chạy.
+  int? _processingDefectId;
   // Track the last persisted AI verdict so the result panel shows the most
   // recent decision even if _currentIndex advances to the next defect.
   int? _lastPersistedDefectId;
@@ -173,10 +178,11 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     );
 
     try {
+      final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
+
       // If we already loaded defects for this run, prefer them; otherwise fetch
       List<Map<String, dynamic>> defectsForBoard = _defects;
       if (defectsForBoard.isEmpty) {
-        final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
         final parsedBoardId = int.tryParse(vrsProvider.currentBoard);
         if (parsedBoardId != null) {
           defectsForBoard = await LocalDatabaseService().getDefectsByBoard(
@@ -208,6 +214,8 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         'board=$boardIdRaw defect=$defectId x=${coords.x} y=${coords.y}',
       );
 
+      setState(() => _processingDefectId = defectId);
+
       // Tải ảnh thiết kế Gerber song song với bước PLC/AI (không await) — nếu
       // QCamber treo/timeout, nó không còn làm chậm việc xử lý defect khi chạy
       // qua nhiều ảnh liên tiếp. QCamberGerberService tự bỏ qua response cũ nhờ
@@ -226,6 +234,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         defectY: coords.y,
         boardId: boardIdRaw?.toString(),
         defectId: defectId,
+        boardSide: vrsProvider.currentBoardSide,
       );
 
       if (!mounted || myRunId != _runId) return;
@@ -245,6 +254,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         );
         setState(() {
           _running = false;
+          _processingDefectId = null;
         });
         StartupHealthCheck.setBusy(false);
         return;
@@ -322,6 +332,9 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         _defects = reloaded;
         _currentIndex = nextIndex;
         _defectListReloadToken++;
+        // Lỗi vừa xong đã được lưu judgement - không còn "đang xử lý" nữa.
+        // Nếu còn lỗi tiếp theo, _inspectCurrentDefect sẽ set lại ngay.
+        _processingDefectId = null;
         if (_currentIndex >= _defects.length) {
           _running = false;
           debugPrint('VRSMainScreen: no more defects - stopping workflow');
@@ -344,6 +357,27 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
           listen: false,
         );
         await vrsProviderForNextBoard.completeCurrentBoardAndCheckNext();
+
+        // Board (hoặc mặt) vừa xong -> tự động đưa camera về gốc (0, 0)
+        // trước khi vận hành viên lật bo / đặt board mới lên bàn, tránh va
+        // chạm khi thao tác tay ở vị trí camera cũ.
+        try {
+          final moveResult = await _plcGateway.movePlc(
+            x: 0.0,
+            y: 0.0,
+            boardId: boardIdFromProvider,
+          );
+          if (!moveResult.success) {
+            debugPrint(
+              'VRSMainScreen: move PLC ve goc sau khi xong board that bai: '
+              '${moveResult.message}',
+            );
+          }
+        } catch (e) {
+          debugPrint(
+            'VRSMainScreen: loi move PLC ve goc sau khi xong board: $e',
+          );
+        }
       }
 
       if (mounted &&
@@ -383,7 +417,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         modelName: model['name'] ?? 'Model_${model['id_model']}',
         coordinates: coordinates,
         defectType: defect['type'],
-        layerName: 'l8',
+        layerName: board['layer_id']?.toString() ?? 'l8',
         zoom: 8192.0,
       );
     } catch (e) {
@@ -406,6 +440,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       _defects = list;
       _currentIndex = 0;
       _running = true;
+      _processingDefectId = null;
     });
     // Báo health-check tạm dừng trong lúc workflow chạy nhiều request
     // QCamber liên tiếp, tránh chồng request health-check lên request thật.
@@ -424,6 +459,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     StartupHealthCheck.setBusy(false);
     setState(() {
       _running = false;
+      _processingDefectId = null;
     });
     debugPrint('VRSMainScreen: stopped workflow');
   }
@@ -542,20 +578,92 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     return false; // cancel
   }
 
+  /// Board này có đang ở giữa chừng (đã bấm "Dừng" khi soi chưa hết lỗi,
+  /// board vật lý chưa đổi) hay không - để hỏi operator có muốn tiếp tục
+  /// đúng lỗi đang dừng (không calib lại) hay coi như board mới (calib +
+  /// soi lại từ đầu).
+  bool _hasPausedProgressFor(int boardId) {
+    if (_defects.isEmpty || _currentIndex <= 0 || _currentIndex >= _defects.length) {
+      return false;
+    }
+    final firstBoardIdRaw =
+        _defects.first['tbBoardid_board'] ?? _defects.first['board_id'];
+    final firstBoardId = (firstBoardIdRaw is int)
+        ? firstBoardIdRaw
+        : int.tryParse(firstBoardIdRaw?.toString() ?? '');
+    return firstBoardId == boardId;
+  }
+
+  /// Hỏi operator khi resume 1 board đang dừng giữa chừng: tiếp tục đúng lỗi
+  /// đang dừng (KHÔNG calib lại - board chưa bị động vào), hay coi như board
+  /// vừa được gá lại (calib lại + soi từ đầu). Trả null nếu bấm "Hủy".
+  Future<String?> _showResumeOrRestartDialog() {
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Tiếp tục board đang dừng?'),
+        content: Text(
+          'Board này đang dừng ở lỗi ${_currentIndex + 1}/${_defects.length}.\n\n'
+          'Nếu board KHÔNG bị di chuyển trong lúc dừng: tiếp tục đúng lỗi này, '
+          'không cần calib lại.\n\n'
+          'Nếu board đã bị tháo ra / gá lại / lật mặt: nên calib lại và soi '
+          'lại từ đầu.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('Hủy'),
+          ),
+          OutlinedButton(
+            onPressed: () => Navigator.pop(ctx, 'restart'),
+            child: const Text('Board đã bị động, calib lại'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, 'resume'),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+            child: const Text('Tiếp tục, không calib'),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// Bấm "Bắt đầu" — calib bù lệch board trước rồi mới chạy workflow.
   /// Luôn calib khi bắt đầu board mới (board đầu tiên hoặc board bất kỳ khi
-  /// operator bấm Start thủ công) vì board vừa được đặt/lật lên bàn.
+  /// operator bấm Start thủ công) vì board vừa được đặt/lật lên bàn - TRỪ
+  /// khi đang resume đúng board vừa dừng giữa chừng, lúc đó hỏi operator
+  /// (xem [_showResumeOrRestartDialog]) vì chỉ operator mới biết board có bị
+  /// động vào lúc dừng hay không.
   Future<void> _startWithCalibration(int boardId) async {
+    if (_hasPausedProgressFor(boardId)) {
+      final choice = await _showResumeOrRestartDialog();
+      if (choice == null || !mounted) return; // Hủy
+      if (choice == 'resume') {
+        final myRunId = ++_runId;
+        setState(() => _running = true);
+        StartupHealthCheck.setBusy(true);
+        await _inspectCurrentDefect(myRunId);
+        return;
+      }
+      // choice == 'restart' → rơi xuống dưới, chạy calib + soi lại từ đầu
+      // như 1 board vừa được gá lên máy.
+    }
+
     // Đọc board row để xác định layer_id → board side
     final db = LocalDatabaseService();
     final boardRow = await db.getBoardById(boardId);
     final layerId = boardRow?['layer_id']?.toString();
     final side = VRSProvider.boardSideFromLayerId(layerId);
 
-    // Cập nhật currentBoardSide trên provider (lần đầu chưa set)
+    // Đồng bộ currentBoardSide/currentBoardCode trên provider NGAY (không
+    // đợi advanceToNextBoard) - Manual VRS screen đọc currentBoardSide để
+    // gọi bù lệch, nên phải đúng ngay từ lúc board này bắt đầu chạy.
     final vrs = Provider.of<VRSProvider>(context, listen: false);
-    // Provider chưa expose setter trực tiếp → ta calib với side vừa tính,
-    // rồi advanceToNextBoard sẽ sync lại khi chuyển board sau này.
+    vrs.setCurrentBoardMeta(
+      code: boardRow?['board_code']?.toString() ?? '',
+      side: side,
+    );
 
     setState(() => _calibrating = true);
 
@@ -637,6 +745,33 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       });
       await _startWorkflow(newBoardId);
     }
+  }
+
+  /// Bấm "Tải lại dữ liệu" ở panel "Đã hoàn tất lô" - kiểm tra ngay DB xem
+  /// AOI_Ingest đã ghi thêm board mới chưa, thay vì đợi timer poll 5s ở
+  /// [_newBoardPollTimer]. Chỉ cần thiết khi vận hành viên muốn biết ngay
+  /// (vd đang đứng chờ AOI xuất board tiếp theo).
+  Future<void> _checkForNewBoardManually() async {
+    if (_checkingNewBoard) return;
+    setState(() => _checkingNewBoard = true);
+
+    final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
+    final found = await vrsProvider.checkForNewBoard();
+
+    if (!mounted) return;
+    setState(() => _checkingNewBoard = false);
+
+    scaffoldMessengerKey.currentState?.showSnackBar(
+      SnackBar(
+        content: Text(
+          found
+              ? '✅ Đã tìm thấy board mới - bấm "Board tiếp theo" để xử lý'
+              : 'Chưa có board mới nào trong lô này',
+        ),
+        backgroundColor: found ? Colors.green : Colors.grey.shade700,
+        duration: const Duration(seconds: 3),
+      ),
+    );
   }
 
   @override
@@ -1059,6 +1194,21 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                           const SizedBox(height: 12),
                           _buildInfoRow('Số thứ tự bo:', boardText),
                           const SizedBox(height: 12),
+                          _buildInfoRow(
+                            'Tên board (AOI):',
+                            vrsProvider.currentBoardCode.isNotEmpty
+                                ? vrsProvider.currentBoardCode
+                                : 'Chưa có',
+                          ),
+                          const SizedBox(height: 12),
+                          _buildInfoRow(
+                            'Mặt board:',
+                            boardText != 'Chưa có'
+                                ? '${vrsProvider.currentBoardSide}'
+                                      '${vrsProvider.currentBoardSide == "A" ? " (Top)" : " (Bot)"}'
+                                : 'Chưa có',
+                          ),
+                          const SizedBox(height: 12),
                           _buildInfoRow('Loại lỗi AI dự đoán:', aiText),
                           const SizedBox(height: 12),
                           // Total defects for current board
@@ -1225,6 +1375,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                             boardId: int.tryParse(boardText),
                             height: 200,
                             reloadToken: _defectListReloadToken,
+                            processingDefectId: _processingDefectId,
                           ),
 
                           const SizedBox(height: 16),
@@ -1359,15 +1510,43 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                                 color: Colors.green.shade50,
                                 borderRadius: BorderRadius.circular(8),
                               ),
-                              child: Text(
-                                vrsProvider.lastCompletedBoardId.isNotEmpty
-                                    ? 'Đã hoàn tất board cuối cùng (Board #${vrsProvider.lastCompletedBoardId}). '
-                                          'Không còn board nào khác trong lô này.'
-                                    : 'Đã hoàn tất toàn bộ board trong lô này.',
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  color: Colors.green.shade800,
-                                ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    vrsProvider.lastCompletedBoardId.isNotEmpty
+                                        ? 'Đã hoàn tất board cuối cùng (Board #${vrsProvider.lastCompletedBoardId}). '
+                                              'Không còn board nào khác trong lô này.'
+                                        : 'Đã hoàn tất toàn bộ board trong lô này.',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: Colors.green.shade800,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  OutlinedButton.icon(
+                                    onPressed: _checkingNewBoard
+                                        ? null
+                                        : _checkForNewBoardManually,
+                                    icon: _checkingNewBoard
+                                        ? const SizedBox(
+                                            width: 14,
+                                            height: 14,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : const Icon(
+                                            FeatherIcons.refreshCw,
+                                            size: 16,
+                                          ),
+                                    label: Text(
+                                      _checkingNewBoard
+                                          ? 'Đang kiểm tra...'
+                                          : 'Tải lại dữ liệu (kiểm tra board mới)',
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ],

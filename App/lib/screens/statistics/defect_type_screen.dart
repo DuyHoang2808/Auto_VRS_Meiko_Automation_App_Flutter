@@ -377,16 +377,50 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
     );
   }
 
+  // Khóa theo tên kỹ thuật thực tế lưu trong cột `type` của tbDefect (xem
+  // `_getDefectDisplayName` trong vrs_main_screen.dart) - KHÔNG phải tên
+  // hiển thị tiếng Việt, nếu không mọi loại lỗi đều rơi vào default (xám).
   Color _getDefectColor(String defectType) {
-    switch (defectType) {
-      case 'Hở mạch':
+    switch (defectType.toLowerCase()) {
+      case 'bamdinhkhongtot':
+        return Colors.brown;
+      case 'chamkim':
         return Colors.red;
-      case 'Thiếu linh kiện':
-        return Colors.blue;
-      case 'Nhiễu ảnh':
-        return Colors.green;
-      case 'Xước mạch':
+      case 'divat':
         return Colors.orange;
+      case 'divatduongmach':
+        return Colors.deepOrange;
+      case 'khuyetmach':
+        return Colors.purple;
+      case 'nganmach':
+        return Colors.pink;
+      case 'thieudong':
+        return Colors.blue;
+      case 'thieudongduongmach':
+        return Colors.lightBlue;
+      case 'thuadong':
+        return Colors.green;
+      case 'thuadongduongmach':
+        return Colors.teal;
+      case 'vetlom':
+        return Colors.indigo;
+      case 'xuoc':
+        return Colors.amber;
+      case 'other':
+        return Colors.blueGrey;
+      // Legacy names (tương thích ngược, xem _getDefectDisplayName)
+      case 'short_circuit':
+        return Colors.pinkAccent;
+      case 'missing_component':
+        return Colors.blueAccent;
+      case 'damaged_track':
+        return Colors.cyan;
+      case 'solder_bridge':
+        return Colors.lime;
+      case 'crack':
+        return Colors.deepPurple;
+      case 'person':
+        return Colors.grey;
       default:
         return Colors.grey;
     }

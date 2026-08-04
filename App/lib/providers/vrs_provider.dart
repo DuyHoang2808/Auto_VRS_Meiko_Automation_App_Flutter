@@ -11,6 +11,9 @@ class VRSProvider extends ChangeNotifier {
   String _currentModelName = '';
   String _currentLot = '';
   String _currentBoard = '';
+  // Mã board (board_code từ AOI_Ingest) - tên hiển thị cho vận hành viên,
+  // khác với id_board (khóa DB nội bộ, không có ý nghĩa với người dùng).
+  String _currentBoardCode = '';
   int _totalCount = 0;
   int _okCount = 0;
   int _ngCount = 0;
@@ -19,6 +22,7 @@ class VRSProvider extends ChangeNotifier {
   bool _nextBoardAvailable = false;
   bool _nextBoardIsNewPhysical = false;
   String _nextBoardId = '';
+  String _nextBoardCode = '';
   bool _lotFinished = false;
 
   // Board side tracking + calibration flag
@@ -43,6 +47,7 @@ class VRSProvider extends ChangeNotifier {
   // Getters
   String get currentLot => _currentLot;
   String get currentBoard => _currentBoard;
+  String get currentBoardCode => _currentBoardCode;
   String get systemStatus => _systemStatus;
   bool get isAutoMode => _isAutoMode;
   String get currentModel => _currentModel;
@@ -172,9 +177,15 @@ class VRSProvider extends ChangeNotifier {
           _currentBoard = board != null
               ? board['id_board'].toString()
               : 'Chưa có';
+          _currentBoardCode = board?['board_code']?.toString() ?? '';
+          _currentBoardSide = boardSideFromLayerId(
+            board?['layer_id']?.toString(),
+          );
         } else {
           _currentLot = 'Chưa có';
           _currentBoard = 'Chưa có';
+          _currentBoardCode = '';
+          _currentBoardSide = 'A';
         }
 
         notifyListeners();
@@ -189,6 +200,8 @@ class VRSProvider extends ChangeNotifier {
     if (lot == null) {
       _currentLot = 'Chưa có';
       _currentBoard = 'Chưa có';
+      _currentBoardCode = '';
+      _currentBoardSide = 'A';
       return;
     }
 
@@ -196,6 +209,8 @@ class VRSProvider extends ChangeNotifier {
 
     final board = await _db.getFirstBoardByLotId(_currentLot);
     _currentBoard = board != null ? board['id_board'].toString() : 'Chưa có';
+    _currentBoardCode = board?['board_code']?.toString() ?? '';
+    _currentBoardSide = boardSideFromLayerId(board?['layer_id']?.toString());
   }
 
   /// Gọi khi workflow tự động đã chạy hết toàn bộ lỗi của board hiện tại.
@@ -226,6 +241,7 @@ class VRSProvider extends ChangeNotifier {
         _nextBoardIsNewPhysical =
             currentCode == null || nextCode == null || currentCode != nextCode;
         _nextBoardId = nextBoardRow['id_board'].toString();
+        _nextBoardCode = nextCode ?? '';
         _nextBoardAvailable = true;
         _lotFinished = false;
         _lastCompletedBoardId = '';
@@ -245,8 +261,10 @@ class VRSProvider extends ChangeNotifier {
         // lại đúng board vừa xong nếu bấm nhầm).
         _lastCompletedBoardId = _currentBoard;
         _currentBoard = 'Chưa có';
+        _currentBoardCode = '';
         _nextBoardAvailable = false;
         _nextBoardId = '';
+        _nextBoardCode = '';
         _lotFinished = true;
       }
       notifyListeners();
@@ -265,16 +283,21 @@ class VRSProvider extends ChangeNotifier {
   /// Không tự động chạy ngay khi tìm thấy board mới - chỉ chuyển sang trạng
   /// thái "board tiếp theo" (giống hệt [completeCurrentBoardAndCheckNext])
   /// để vận hành viên xác nhận trước (đặt board mới lên bàn / lật bo).
-  Future<void> checkForNewBoard() async {
+  ///
+  /// Trả `true` nếu vừa tìm thấy 1 board mới (mới set `nextBoardAvailable`),
+  /// `false` nếu không có gì mới - dùng để hiện phản hồi khi vận hành viên
+  /// bấm nút "Tải lại dữ liệu" thủ công (xem VRSMainScreen), thay vì chỉ
+  /// gọi ngầm từ timer polling.
+  Future<bool> checkForNewBoard() async {
     // Đã có board đang xử lý hoặc đã tìm thấy board chờ xác nhận - không cần
     // check lại, tránh query DB thừa mỗi lần timer chạy.
-    if (_currentBoard.isNotEmpty && _currentBoard != 'Chưa có') return;
-    if (_nextBoardAvailable) return;
-    if (_currentLot.isEmpty || _currentLot == 'Chưa có') return;
+    if (_currentBoard.isNotEmpty && _currentBoard != 'Chưa có') return false;
+    if (_nextBoardAvailable) return true;
+    if (_currentLot.isEmpty || _currentLot == 'Chưa có') return false;
 
     try {
       final nextBoardRow = await _db.getFirstBoardByLotId(_currentLot);
-      if (nextBoardRow == null) return; // vẫn chưa có board mới nào
+      if (nextBoardRow == null) return false; // vẫn chưa có board mới nào
 
       Map<String, dynamic>? lastCompletedBoardRow;
       final lastId = int.tryParse(_lastCompletedBoardId);
@@ -287,6 +310,7 @@ class VRSProvider extends ChangeNotifier {
       _nextBoardIsNewPhysical =
           currentCode == null || nextCode == null || currentCode != nextCode;
       _nextBoardId = nextBoardRow['id_board'].toString();
+      _nextBoardCode = nextCode ?? '';
       _nextBoardAvailable = true;
       _lotFinished = false;
 
@@ -298,8 +322,10 @@ class VRSProvider extends ChangeNotifier {
           boardSideFromLayerId(lastLayerId) != _nextBoardSide;
 
       notifyListeners();
+      return true;
     } catch (e) {
       debugPrint('Error checking for newly ingested board: $e');
+      return false;
     }
   }
 
@@ -310,13 +336,28 @@ class VRSProvider extends ChangeNotifier {
   Future<void> advanceToNextBoard() async {
     if (!_nextBoardAvailable || _nextBoardId.isEmpty) return;
     _currentBoard = _nextBoardId;
+    _currentBoardCode = _nextBoardCode;
     _currentBoardSide = _nextBoardSide;
     _nextBoardAvailable = false;
     _nextBoardIsNewPhysical = false;
     _nextBoardId = '';
+    _nextBoardCode = '';
     _lotFinished = false;
     _lastCompletedBoardId = '';
     _calibrationNeeded = false;
+    notifyListeners();
+  }
+
+  /// Đồng bộ board_code + mặt board hiện tại khi board được khởi động thủ
+  /// công (nút "Bắt đầu" → `_startWithCalibration`), tức KHÔNG đi qua
+  /// [advanceToNextBoard]. Nếu không gọi hàm này, `currentBoardSide` giữ giá
+  /// trị cũ (mặc định 'A' hoặc mặt của board trước) - sai nếu board đầu
+  /// tiên của model/lô là mặt B, hoặc khi bấm "Bắt đầu" thay vì "Board tiếp
+  /// theo". Các nơi đọc `currentBoardSide` để gọi API bù lệch (vd Manual VRS
+  /// screen) phụ thuộc vào giá trị này luôn đúng với board đang xử lý.
+  void setCurrentBoardMeta({required String code, required String side}) {
+    _currentBoardCode = code;
+    _currentBoardSide = side;
     notifyListeners();
   }
 

@@ -195,16 +195,46 @@ class StatisticsProvider extends ChangeNotifier {
         .toList();
   }
 
+  // Khóa theo tên kỹ thuật thực tế lưu trong cột `type` của tbDefect (xem
+  // `_getDefectDisplayName` trong vrs_main_screen.dart) - KHÔNG phải tên
+  // hiển thị tiếng Việt, nếu không mọi loại lỗi đều rơi vào default (xám).
   int _getDefectColor(String defectType) {
-    switch (defectType) {
-      case 'Hở mạch':
+    switch (defectType.toLowerCase()) {
+      case 'bamdinhkhongtot':
+        return 0xFF8D6E63; // Brown
+      case 'chamkim':
         return 0xFFEF4444; // Red
-      case 'Thiếu linh kiện':
+      case 'divat':
+        return 0xFFF97316; // Orange
+      case 'divatduongmach':
+        return 0xFFEA580C; // Deep orange
+      case 'khuyetmach':
+        return 0xFF9333EA; // Purple
+      case 'nganmach':
+        return 0xFFEC4899; // Pink
+      case 'thieudong':
         return 0xFF3B82F6; // Blue
-      case 'Nhiễu ảnh':
+      case 'thieudongduongmach':
+        return 0xFF0EA5E9; // Light blue
+      case 'thuadong':
         return 0xFF10B981; // Green
-      case 'Xước mạch':
-        return 0xFFF59E0B; // Yellow
+      case 'thuadongduongmach':
+        return 0xFF14B8A6; // Teal
+      case 'vetlom':
+        return 0xFF6366F1; // Indigo
+      case 'xuoc':
+        return 0xFFF59E0B; // Amber
+      // Legacy names (tương thích ngược, xem _getDefectDisplayName)
+      case 'short_circuit':
+        return 0xFFEC4899; // Pink accent
+      case 'missing_component':
+        return 0xFF3B82F6; // Blue accent
+      case 'damaged_track':
+        return 0xFF06B6D4; // Cyan
+      case 'solder_bridge':
+        return 0xFFA3E635; // Lime
+      case 'crack':
+        return 0xFF7C3AED; // Deep purple
       default:
         return 0xFF6B7280; // Gray
     }

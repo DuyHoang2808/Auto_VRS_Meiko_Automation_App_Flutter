@@ -63,6 +63,7 @@ class PlcGatewayService {
     required double defectY,
     String? boardId,
     int? defectId,
+    String boardSide = 'A',
 
     // PLC Configuration
     String plcPcIp = '192.168.3.101',
@@ -87,6 +88,7 @@ class PlcGatewayService {
         'defect_y': defectY,
         'board_id': boardId,
         'defect_id': defectId,
+        'board_side': boardSide,
         'plc_pc_ip': plcPcIp,
         'plc_ip': plcIp,
         'plc_port': plcPort,
