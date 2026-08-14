@@ -267,6 +267,11 @@ class _SelectModelScreenState extends State<SelectModelScreen> {
                         ),
                         const SizedBox(width: 8),
                         IconButton(
+                          tooltip: 'Sửa kích thước Line/Space',
+                          icon: Icon(Icons.edit, color: Colors.blue.shade600),
+                          onPressed: () => _showEditSizesDialog(model),
+                        ),
+                        IconButton(
                           tooltip: 'Xóa',
                           icon: const Icon(Icons.delete, color: Colors.red),
                           onPressed: () => _onDeleteModel(model),
@@ -348,6 +353,118 @@ class _SelectModelScreenState extends State<SelectModelScreen> {
         },
       );
     }
+  }
+
+  Future<void> _showEditSizesDialog(Map<String, dynamic> model) async {
+    final formKey = GlobalKey<FormState>();
+    final lineSizeController = TextEditingController(
+      text: model['line_size']?.toString() ?? '',
+    );
+    final spaceSizeController = TextEditingController(
+      text: model['space_size']?.toString() ?? '',
+    );
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Sửa kích thước - ${model['id_model']}'),
+        content: Form(
+          key: formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: lineSizeController,
+                decoration: const InputDecoration(
+                  labelText: 'Kích thước Line (line_size)',
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Vui lòng nhập kích thước Line';
+                  }
+                  if (double.tryParse(value) == null) {
+                    return 'Vui lòng nhập số hợp lệ';
+                  }
+                  return null;
+                },
+              ),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: spaceSizeController,
+                decoration: const InputDecoration(
+                  labelText: 'Kích thước Space (space_size)',
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Vui lòng nhập kích thước Space';
+                  }
+                  if (double.tryParse(value) == null) {
+                    return 'Vui lòng nhập số hợp lệ';
+                  }
+                  return null;
+                },
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Hủy'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              if (formKey.currentState!.validate()) {
+                Navigator.pop(dialogContext, true);
+              }
+            },
+            child: const Text('Lưu'),
+          ),
+        ],
+      ),
+    );
+
+    if (saved == true) {
+      final idModel = model['id_model'];
+      if (idModel is int) {
+        try {
+          await LocalDatabaseService().updateModelSizes(
+            idModel,
+            lineSize: double.parse(lineSizeController.text.trim()),
+            spaceSize: double.parse(spaceSizeController.text.trim()),
+          );
+          if (mounted) {
+            await _loadModels();
+            scaffoldMessengerKey.currentState?.showSnackBar(
+              SnackBar(
+                content: Text('Đã cập nhật kích thước mã hàng $idModel'),
+                backgroundColor: Colors.green,
+              ),
+            );
+          }
+        } catch (e) {
+          if (mounted) {
+            scaffoldMessengerKey.currentState?.showSnackBar(
+              SnackBar(
+                content: Text('Lỗi khi cập nhật: $e'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+        }
+      }
+    }
+
+    lineSizeController.dispose();
+    spaceSizeController.dispose();
   }
 
   Future<void> _onDeleteModel(Map<String, dynamic> model) async {

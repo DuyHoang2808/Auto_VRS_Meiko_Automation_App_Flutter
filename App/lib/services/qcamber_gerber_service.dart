@@ -25,6 +25,15 @@ class QCamberGerberService extends ChangeNotifier {
   bool get hasImage => _gerberImage != null;
   String get _baseUrl => AppRuntimeConfig.instance.qcamberBaseUrl;
 
+  /// Cắt ngắn body của response để đưa vào log / `lastError`.
+  ///
+  /// Response của QCamber có thể mang ảnh (base64) nên phải giới hạn: chuỗi này
+  /// vừa vào console vừa được hiển thị lên UI.
+  static String _shortBody(String body, {int maxChars = 200}) {
+    if (body.length <= maxChars) return body;
+    return '${body.substring(0, maxChars)}... (${body.length} ký tự)';
+  }
+
   /// Kiểm tra QCamber server có đang chạy không (GET /api/status)
   Future<bool> isServerRunning({int timeout = 2}) async {
     try {
@@ -117,7 +126,8 @@ class QCamberGerberService extends ChangeNotifier {
       debugPrint('📥 QCamber Response: Status=${response.statusCode}');
 
       if (response.statusCode != 200) {
-        _lastError = 'HTTP ${response.statusCode}: ${response.body}';
+        // Cắt ngắn body: cùng lý do như nhánh JSON bên dưới.
+        _lastError = 'HTTP ${response.statusCode}: ${_shortBody(response.body)}';
         debugPrint('❌ QCamber Error: $_lastError');
         _isLoading = false;
         notifyListeners();
@@ -149,11 +159,25 @@ class QCamberGerberService extends ChangeNotifier {
         notifyListeners();
         return true;
       } else if (contentType.contains('application/json')) {
-        // JSON response (acknowledgment)
+        // JSON response (acknowledgment) - KHÔNG đưa body vào thông báo.
+        //
+        // QCamber trả ảnh dạng base64 trong JSON, nên in cả `jsonResponse` là đổ
+        // vài trăm KB base64 vào console MỖI lần tải Gerber (tức mỗi lần chuyển
+        // lỗi ở VRS thủ công). Chuỗi này còn gán vào `_lastError` - thứ được
+        // hiện lên UI - nên base64 có thể tràn cả ra màn hình.
         final jsonResponse = jsonDecode(response.body);
-        _lastMetadata = jsonResponse;
+        final keys = jsonResponse is Map
+            ? jsonResponse.keys.join(', ')
+            : jsonResponse.runtimeType.toString();
+        _lastMetadata = {
+          'modelName': modelName,
+          'layerName': layerName,
+          'responseKeys': keys,
+          'responseBytes': response.bodyBytes.length,
+        };
         _lastError =
-            'QCamber returned acknowledgment but no image data. Response: $jsonResponse';
+            'QCamber trả JSON chứ không phải ảnh PNG '
+            '(khoá: $keys; ${response.bodyBytes.length} byte).';
         debugPrint('⚠️ QCamber: $_lastError');
         _isLoading = false;
         notifyListeners();

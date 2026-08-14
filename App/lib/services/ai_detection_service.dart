@@ -9,6 +9,7 @@ class AIDetectionResult {
   final String message;
   final List<DefectDetection> detections;
   final Uint8List? processedImage;
+  final String? imagePath;
   final Map<String, dynamic> statistics;
   final DateTime timestamp;
 
@@ -17,6 +18,7 @@ class AIDetectionResult {
     required this.message,
     required this.detections,
     this.processedImage,
+    this.imagePath,
     required this.statistics,
     required this.timestamp,
   });
@@ -33,6 +35,7 @@ class AIDetectionResult {
       processedImage: json['processed_image_base64'] != null
           ? base64Decode(json['processed_image_base64'])
           : null,
+      imagePath: json['image_path'],
       statistics: json['statistics'] ?? {},
       timestamp: DateTime.parse(
         json['timestamp'] ?? DateTime.now().toIso8601String(),
@@ -124,7 +127,13 @@ class AIDetectionService extends ChangeNotifier {
 
         return _lastResult;
       } else {
-        _lastError = 'HTTP ${response.statusCode}: ${response.body}';
+        // Cắt ngắn body: API này nhận `image_base64`, lỗi 4xx/5xx có thể trả về
+        // kèm request đã gửi -> in cả body là đổ base64 vào console.
+        final body = response.body;
+        final shortBody = body.length <= 200
+            ? body
+            : '${body.substring(0, 200)}... (${body.length} ký tự)';
+        _lastError = 'HTTP ${response.statusCode}: $shortBody';
         debugPrint('❌ AI detection failed: $_lastError');
         return null;
       }

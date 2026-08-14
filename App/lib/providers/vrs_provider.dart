@@ -30,6 +30,20 @@ class VRSProvider extends ChangeNotifier {
   String _currentBoardSide = 'A';
   String _nextBoardSide = 'A';
   bool _calibrationNeeded = false;
+
+  // Lần calib bù lệch thành công gần nhất trong phiên này: id_board + mặt.
+  // Provider sống suốt phiên (được tạo TRÊN router trong main.dart) nên state
+  // này không mất khi chuyển tab Auto VRS <-> VRS thủ công - khác với state của
+  // widget, vốn bị xoá sạch vì màn hình bị dispose khi điều hướng.
+  //
+  // Dùng id_board chứ KHÔNG dùng board_code: board_code không unique trong lot
+  // và hợp lệ khi rỗng (xem các chỗ gán ''), nên key rỗng sẽ trùng giữa các
+  // board khác nhau -> bỏ qua calib cho board thực sự mới.
+  //
+  // Đây chỉ là "gợi ý" - trước khi bỏ qua calib vẫn phải xác minh với gateway
+  // (PlcGatewayService.hasValidOffsetFor), vì file offset có thể đã mất.
+  String _calibratedBoardId = '';
+  String _calibratedSide = '';
   // Board cuối cùng vừa hoàn tất khi không còn board nào khác trong lot -
   // giữ lại chỉ để hiển thị thông báo rõ ràng, KHÔNG dùng làm currentBoard
   // nữa (currentBoard phải reset về 'Chưa có', xem completeCurrentBoardAndCheckNext).
@@ -64,6 +78,7 @@ class VRSProvider extends ChangeNotifier {
   bool get isInitialized => _isInitialized;
   bool get nextBoardAvailable => _nextBoardAvailable;
   bool get nextBoardIsNewPhysical => _nextBoardIsNewPhysical;
+  String get nextBoardId => _nextBoardId;
   bool get lotFinished => _lotFinished;
   String get lastCompletedBoardId => _lastCompletedBoardId;
   String get currentBoardSide => _currentBoardSide;
@@ -164,6 +179,8 @@ class VRSProvider extends ChangeNotifier {
       final model = await _db.getModelById(int.parse(modelId));
 
       if (model != null) {
+        // Đổi model -> đổi board, offset đã calib không còn đúng.
+        invalidateCalibration();
         _currentModel = model['id_model'].toString();
         _currentModelName = 'Model ${model['id_model']}';
 
@@ -196,6 +213,8 @@ class VRSProvider extends ChangeNotifier {
   }
 
   Future<void> _resolveFirstLotAndBoardForModel(String modelId) async {
+    // Chuyển sang board đầu tiên của model -> offset calib cũ không còn đúng.
+    invalidateCalibration();
     final lot = await _db.getFirstLotByModelId(modelId);
     if (lot == null) {
       _currentLot = 'Chưa có';
@@ -335,6 +354,12 @@ class VRSProvider extends ChangeNotifier {
   /// hình gọi hàm này rồi tự gọi `_startWorkflow` với board mới.
   Future<void> advanceToNextBoard() async {
     if (!_nextBoardAvailable || _nextBoardId.isEmpty) return;
+    // Bỏ ghi nhận calib của board CŨ. Có điều kiện, không xoá vô điều kiện:
+    // `_runCalibrationIfNeeded()` calib cho board KẾ rồi mới gọi hàm này, nên
+    // xoá thẳng sẽ mất luôn lần calib vừa làm cho đúng board đang chuyển tới.
+    if (!isCalibratedFor(boardId: _nextBoardId, side: _nextBoardSide)) {
+      invalidateCalibration();
+    }
     _currentBoard = _nextBoardId;
     _currentBoardCode = _nextBoardCode;
     _currentBoardSide = _nextBoardSide;
@@ -359,6 +384,36 @@ class VRSProvider extends ChangeNotifier {
     _currentBoardCode = code;
     _currentBoardSide = side;
     notifyListeners();
+  }
+
+  /// Ghi nhận vừa calib bù lệch THÀNH CÔNG cho board [boardId] mặt [side].
+  /// Gọi từ cả Auto VRS và VRS thủ công, để calib làm ở màn thủ công cũng được
+  /// Auto VRS công nhận (không bắt operator calib lại khi quay về tab Auto).
+  void markCalibrated({required String boardId, required String side}) {
+    if (boardId.isEmpty) return;
+    _calibratedBoardId = boardId;
+    _calibratedSide = side;
+    debugPrint('📐 Da ghi nhan calib: board=$boardId side=$side');
+    notifyListeners();
+  }
+
+  /// Board [boardId] mặt [side] có phải chính là lần calib gần nhất không.
+  ///
+  /// Chỉ là điều kiện CẦN để bỏ qua calib - bên gọi vẫn phải xác minh với
+  /// gateway (`PlcGatewayService.hasValidOffsetFor`) vì file offset có thể đã
+  /// bị mất/ghi đè mà app không biết.
+  bool isCalibratedFor({required String boardId, required String side}) {
+    return boardId.isNotEmpty &&
+        _calibratedBoardId == boardId &&
+        _calibratedSide == side;
+  }
+
+  /// Xoá ghi nhận calib - gọi ở MỌI chỗ board hiện tại thay đổi, vì offset cũ
+  /// không còn đúng cho board mới.
+  void invalidateCalibration() {
+    if (_calibratedBoardId.isEmpty && _calibratedSide.isEmpty) return;
+    _calibratedBoardId = '';
+    _calibratedSide = '';
   }
 
   Future<void> updateCounts({int? total, int? ok, int? ng}) async {
@@ -419,6 +474,7 @@ class VRSProvider extends ChangeNotifier {
   }
 
   Future<void> resetSystem() async {
+    invalidateCalibration();
     _totalCount = 0;
     _okCount = 0;
     _ngCount = 0;

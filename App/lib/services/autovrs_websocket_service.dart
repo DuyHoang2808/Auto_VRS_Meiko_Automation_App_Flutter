@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:autovrs_app/core/app_runtime_config.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:flutter/foundation.dart';
@@ -13,6 +14,50 @@ enum AutoVRSStreamSource { websocket, rtsp }
 class AutoVRSWebSocketService extends ChangeNotifier {
   static const String windowsFfmpegFallbackPath =
       r'D:\Ps_Duy\Driver\ffmpeg-2026-05-06-git-f2e5eff3ff-essentials_build\bin\ffmpeg.exe';
+
+  /// Chiều rộng khung PREVIEW lấy ra từ RTSP.
+  ///
+  /// Luồng gốc là 1080p. Trước đây ffmpeg được yêu cầu encode MJPEG `-q:v 5`
+  /// ở nguyên 1920x1080 rồi bơm qua pipe stdout: mỗi JPEG ~150-250 KB, lớn
+  /// hơn cả buffer pipe (~64 KB) của Windows, nên ffmpeg block ở `write()`
+  /// gần như mỗi frame. Trong lúc block nó KHÔNG đọc socket RTSP nữa ->
+  /// mediamtx coi reader quá chậm và đóng kết nối, đúng chuỗi lỗi thấy trong
+  /// log: `corrupted macroblock` -> `Failed reading RTSP data: End of file`
+  /// -> `Error number -10054` (WSAECONNRESET).
+  ///
+  /// Preview chỉ được vẽ trong một ô vuông vài trăm px nên 960 là dư. Ảnh đưa
+  /// vào AI thì KHÔNG dùng frame preview này - xem [grabFullResolutionFrame].
+  static const int rtspPreviewWidth = 960;
+
+  /// Ngưỡng coi như mất đồng bộ khung JPEG. Một JPEG preview ở
+  /// [rtspPreviewWidth] chỉ cỡ vài chục KB, nên vượt mức này nghĩa là buffer
+  /// đang chứa rác chứ không phải một frame chưa đủ.
+  static const int _rtspMaxFrameBytes = 4 * 1024 * 1024;
+
+  static const Duration _rtspRetryBaseDelay = Duration(seconds: 2);
+  static const Duration _rtspRetryMaxDelay = Duration(seconds: 30);
+
+  /// Khớp mọi dòng log ffmpeg phát ra từ DECODER h264 - tag dạng
+  /// `[h264 @ 0x...]`, `[dec:h264 @ 0x...]`, `[vist#0:0/h264 @ 0x...]`.
+  ///
+  /// Mỗi macroblock hỏng sinh 2-3 dòng nên chúng làm loãng hết terminal, trong
+  /// khi thông tin thì gần như bằng 0: corruption đến từ phía nguồn/đường mạng
+  /// chứ không phải từ app (một reader ffmpeg không có backpressure cũng thấy
+  /// y hệt), và ffmpeg tự bỏ macroblock hỏng rồi giải mã tiếp.
+  ///
+  /// Lọc theo TAG chứ không theo nội dung: decoder có hàng chục thông báo khác
+  /// nhau (`Invalid level prefix`, `out of range intra chroma pred mode`,
+  /// `cbp too large`, `Missing reference picture`...) nên liệt kê nội dung sẽ
+  /// luôn thiếu. Quan trọng hơn, cách này KHÔNG chặn log của demuxer RTSP
+  /// (`[in#0/rtsp @ ...] Failed reading RTSP data`, `Error during demuxing`) -
+  /// đó là dấu hiệu luồng chết, phải luôn thấy.
+  static final RegExp _ffmpegDecoderNoise = RegExp(r'\[[^\]]*h264 @ ');
+
+  /// Bao lâu thì in 1 dòng tổng kết số log đã bỏ qua. Giữ lại tín hiệu này để
+  /// nếu tỉ lệ corruption tăng vọt thì vẫn nhận ra, mà không phải chịu hàng
+  /// trăm dòng mỗi phút.
+  static const Duration _ffmpegNoiseReportInterval = Duration(seconds: 60);
+
   // SICK Camera WebSocket Stream (port 8999)
   // Old C++ module was on ws://127.0.0.1:12345/
 
@@ -21,7 +66,33 @@ class AutoVRSWebSocketService extends ChangeNotifier {
   Process? _rtspProcess;
   StreamSubscription<List<int>>? _rtspStdoutSubscription;
   StreamSubscription<String>? _rtspStderrSubscription;
-  final List<int> _rtspBuffer = <int>[];
+
+  // Buffer byte thô đọc từ stdout của ffmpeg.
+  //
+  // Dùng Uint8List + độ dài tường minh thay cho `List<int>`: việc tìm marker
+  // phải quét tuyến tính toàn buffer, và trên growable List<int> mỗi phần tử
+  // là một slot Object? nên vòng quét chậm hơn nhiều lần - chính vòng quét đó
+  // chạy trên UI isolate và là một phần lý do pipe không được hút kịp.
+  Uint8List _rtspBuffer = Uint8List(0);
+  int _rtspBufferLength = 0;
+
+  // Vị trí đã quét xong khi đi tìm EOI (0xFFD9). Bản cũ luôn quét lại từ
+  // index 2 mỗi lần có chunk mới -> O(n^2) trên mỗi frame.
+  int _rtspScanOffset = 0;
+
+  // Bộ đếm log decoder đã bỏ qua, để in tổng kết định kỳ.
+  final Stopwatch _ffmpegNoiseWindow = Stopwatch();
+  int _ffmpegNoiseCount = 0;
+  // Dòng ffmpeg vừa rồi có bị bỏ qua hay không - dùng để bỏ luôn dòng
+  // "Last message repeated N times" đi kèm, nếu không nó sẽ đứng trơ ra mà
+  // không còn thông báo gốc nào ở trên.
+  bool _lastFfmpegLineSuppressed = false;
+
+  Timer? _rtspRetryTimer;
+  int _rtspRetryAttempt = 0;
+  // true khi luồng bị ngắt do người dùng/đổi nguồn video, để retry tự động
+  // không hồi sinh một luồng đã được chủ động tắt.
+  bool _rtspStoppedByUser = false;
 
   // ValueNotifiers for better performance
   final ValueNotifier<bool> _isConnectedNotifier = ValueNotifier<bool>(false);
@@ -162,13 +233,30 @@ class AutoVRSWebSocketService extends ChangeNotifier {
     }
   }
 
+  /// Mở luồng RTSP theo yêu cầu của người dùng (dialog nguồn video, khởi động
+  /// app, đổi endpoint). Reset bộ đếm backoff để lần thử đầu tiên không bị
+  /// trễ theo lịch retry của phiên trước.
   Future<bool> connectRtsp({
+    String? rtspUrl,
+    String? ffmpegPath,
+    int? fps,
+  }) async {
+    _cancelRtspRetry();
+    _rtspRetryAttempt = 0;
+    return _openRtspStream(rtspUrl: rtspUrl, ffmpegPath: ffmpegPath, fps: fps);
+  }
+
+  Future<bool> _openRtspStream({
     String? rtspUrl,
     String? ffmpegPath,
     int? fps,
   }) async {
     try {
       await disconnect(notify: false);
+      // `disconnect` bật cờ "người dùng tự tắt" để chặn retry; ở đây ta đang
+      // chủ động mở lại nên phải hạ cờ, nếu không luồng sẽ không bao giờ tự
+      // kết nối lại sau lần chết đầu tiên.
+      _rtspStoppedByUser = false;
       final token = ++_connectionToken;
 
       final resolvedRtspUrl =
@@ -202,14 +290,18 @@ class AutoVRSWebSocketService extends ChangeNotifier {
         '-i',
         _rtspUrl,
         '-an',
+        // scale=W:-2 giữ đúng tỉ lệ khung và làm tròn chiều cao về số chẵn
+        // (yuvj420p của MJPEG yêu cầu kích thước chia hết cho 2).
         '-vf',
-        'fps=$_rtspFps',
+        'fps=$_rtspFps,scale=$rtspPreviewWidth:-2',
         '-f',
         'image2pipe',
         '-vcodec',
         'mjpeg',
+        // q:v 8 thay vì 5: preview không cần chất lượng lưu trữ, và mỗi bậc
+        // q cắt thêm byte phải đi qua pipe.
         '-q:v',
-        '5',
+        '8',
         'pipe:1',
       ];
 
@@ -218,7 +310,7 @@ class AutoVRSWebSocketService extends ChangeNotifier {
         args,
       ).timeout(const Duration(seconds: 8));
       _rtspProcess = process;
-      _rtspBuffer.clear();
+      _resetRtspBuffer();
 
       _rtspStdoutSubscription = process.stdout.listen(
         (chunk) => _handleRtspBytes(chunk, token),
@@ -227,11 +319,7 @@ class AutoVRSWebSocketService extends ChangeNotifier {
       _rtspStderrSubscription = process.stderr
           .transform(utf8.decoder)
           .transform(const LineSplitter())
-          .listen((line) {
-            if (line.trim().isNotEmpty) {
-              debugPrint('RTSP/ffmpeg: $line');
-            }
-          });
+          .listen(_handleFfmpegLogLine);
 
       process.exitCode.then((code) {
         if (_isDisposed) return;
@@ -239,11 +327,14 @@ class AutoVRSWebSocketService extends ChangeNotifier {
             _streamSource == AutoVRSStreamSource.rtsp &&
             identical(_rtspProcess, process)) {
           _setConnected(false);
-          _clearCurrentFrame();
+          // KHÔNG xoá frame cuối: giữ nó lại để preview đứng hình trong lúc
+          // chờ kết nối lại thay vì nháy sang "AutoVRS Disconnected" rồi
+          // quay lại. Badge trạng thái đã đổi sang đỏ nhờ _setConnected.
           _lastError = code == 0
               ? 'RTSP stream stopped'
               : 'RTSP stream stopped (ffmpeg exit code $code)';
           _notifyListenersIfAlive();
+          _scheduleRtspRetry();
         }
       });
 
@@ -257,14 +348,102 @@ class AutoVRSWebSocketService extends ChangeNotifier {
       _setConnected(false);
       _notifyListenersIfAlive();
       debugPrint('RTSP connection failed: $e');
+      // Server chưa lên / mất mạng cũng phải thử lại, không chỉ trường hợp
+      // ffmpeg chạy được rồi mới chết.
+      _scheduleRtspRetry();
       return false;
     }
+  }
+
+  /// Hẹn kết nối lại RTSP với backoff luỹ tiến (2s, 4s, 8s... tối đa 30s).
+  ///
+  /// Trước đây khi ffmpeg chết không có cơ chế nào thử lại: luồng chỉ sống lại
+  /// nếu người dùng tình cờ điều hướng qua Manual VRS (nơi có gọi
+  /// `connectLastSource`). Đó là lý do log cũ có những dòng "Connected to RTSP
+  /// stream" rải rác không theo chu kỳ nào.
+  void _scheduleRtspRetry() {
+    if (_isDisposed || _rtspStoppedByUser) return;
+    if (_streamSource != AutoVRSStreamSource.rtsp) return;
+    // Đã có hẹn rồi thì không xếp thêm - cả `exitCode` lẫn `onError` của
+    // stdout đều có thể bắn khi luồng chết, và hai lần hẹn sẽ tạo ra hai
+    // tiến trình ffmpeg cùng đọc một stream.
+    if (_rtspRetryTimer != null) return;
+
+    _rtspRetryAttempt++;
+    final backoffMs =
+        _rtspRetryBaseDelay.inMilliseconds *
+        (1 << (_rtspRetryAttempt - 1).clamp(0, 5));
+    final delay = Duration(
+      milliseconds: backoffMs.clamp(
+        _rtspRetryBaseDelay.inMilliseconds,
+        _rtspRetryMaxDelay.inMilliseconds,
+      ),
+    );
+
+    debugPrint(
+      'RTSP: mất luồng, thử kết nối lại lần #$_rtspRetryAttempt '
+      'sau ${delay.inSeconds}s',
+    );
+
+    _rtspRetryTimer = Timer(delay, () {
+      _rtspRetryTimer = null;
+      if (_isDisposed || _rtspStoppedByUser) return;
+      if (_streamSource != AutoVRSStreamSource.rtsp) return;
+      _openRtspStream();
+    });
+  }
+
+  void _cancelRtspRetry() {
+    _rtspRetryTimer?.cancel();
+    _rtspRetryTimer = null;
+  }
+
+  /// In log của ffmpeg, nhưng chặn phần nhiễu từ decoder h264
+  /// (xem [_ffmpegDecoderNoise]) và thay bằng 1 dòng tổng kết mỗi
+  /// [_ffmpegNoiseReportInterval].
+  void _handleFfmpegLogLine(String line) {
+    final text = line.trim();
+    if (text.isEmpty) return;
+
+    final isNoise =
+        _ffmpegDecoderNoise.hasMatch(text) ||
+        (_lastFfmpegLineSuppressed &&
+            text.startsWith('Last message repeated'));
+
+    if (!isNoise) {
+      _lastFfmpegLineSuppressed = false;
+      debugPrint('RTSP/ffmpeg: $text');
+      return;
+    }
+
+    _lastFfmpegLineSuppressed = true;
+    _ffmpegNoiseCount++;
+    if (!_ffmpegNoiseWindow.isRunning) {
+      _ffmpegNoiseWindow.start();
+      return;
+    }
+    if (_ffmpegNoiseWindow.elapsed < _ffmpegNoiseReportInterval) return;
+
+    debugPrint(
+      'RTSP/ffmpeg: bỏ qua $_ffmpegNoiseCount dòng lỗi giải mã h264 trong '
+      '${_ffmpegNoiseWindow.elapsed.inSeconds}s (corruption từ phía nguồn, '
+      'không phải từ app)',
+    );
+    _ffmpegNoiseCount = 0;
+    _ffmpegNoiseWindow
+      ..reset()
+      ..start();
   }
 
   /// Ngắt kết nối WebSocket
   Future<void> disconnect({bool notify = true}) async {
     _connectionToken++;
     _notifierUpdateToken++;
+    // Ngắt chủ động: huỷ mọi lịch retry đang treo, nếu không luồng RTSP vừa
+    // tắt sẽ tự bật lại sau vài giây (kể cả khi người dùng đã đổi sang nguồn
+    // WebSocket).
+    _rtspStoppedByUser = true;
+    _cancelRtspRetry();
 
     if (_subscription != null) {
       await _subscription!.cancel();
@@ -364,7 +543,21 @@ class AutoVRSWebSocketService extends ChangeNotifier {
 
     final process = _rtspProcess;
     _rtspProcess = null;
-    _rtspBuffer.clear();
+    _resetRtspBuffer();
+
+    // Xả nốt phần đã đếm trước khi reset, nếu không một luồng chết trước mốc
+    // 60s sẽ mang theo toàn bộ số liệu corruption mà không in ra dòng nào.
+    if (_ffmpegNoiseCount > 0) {
+      debugPrint(
+        'RTSP/ffmpeg: bỏ qua $_ffmpegNoiseCount dòng lỗi giải mã h264 trong '
+        '${_ffmpegNoiseWindow.elapsed.inSeconds}s (luồng vừa dừng)',
+      );
+    }
+    _ffmpegNoiseCount = 0;
+    _lastFfmpegLineSuppressed = false;
+    _ffmpegNoiseWindow
+      ..stop()
+      ..reset();
 
     if (process != null) {
       process.kill();
@@ -422,32 +615,67 @@ class AutoVRSWebSocketService extends ChangeNotifier {
     if (_isDisposed) return;
 
     try {
-      _rtspBuffer.addAll(chunk);
+      _appendToRtspBuffer(chunk);
+
+      // Chỉ đẩy frame MỚI NHẤT của lượt parse này lên UI.
+      //
+      // Bản cũ gọi `_setCurrentFrame` cho mọi frame tìm thấy trong buffer, và
+      // mỗi lần lại schedule một `addPostFrameCallback` giữ tham chiếu tới cả
+      // buffer JPEG (xem `_setValueNotifierIfAlive`). Khi app render không
+      // kịp - hoặc cửa sổ bị minimize nên Flutter ngừng sinh frame - hàng
+      // callback đó dồn lại và giữ sống toàn bộ frame trong bộ nhớ, trong khi
+      // UI cuối cùng cũng chỉ vẽ được frame cuối.
+      Uint8List? latestFrame;
 
       while (true) {
-        final start = _indexOfJpegMarker(_rtspBuffer, 0xff, 0xd8, 0);
+        final start = _indexOfRtspMarker(0xd8, 0);
         if (start < 0) {
-          if (_rtspBuffer.length > 1024 * 1024) {
-            _rtspBuffer.clear();
+          // Chưa thấy SOI: dữ liệu đang có là rác. Giữ lại 1 byte cuối vì nó
+          // có thể là nửa đầu (0xFF) của marker bị chunk cắt đôi.
+          if (_rtspBufferLength > 1) {
+            _discardRtspBufferFront(_rtspBufferLength - 1);
           }
-          return;
+          break;
         }
-
         if (start > 0) {
-          _rtspBuffer.removeRange(0, start);
+          _discardRtspBufferFront(start);
         }
 
-        final end = _indexOfJpegMarker(_rtspBuffer, 0xff, 0xd9, 2);
+        final end = _indexOfRtspMarker(
+          0xd9,
+          _rtspScanOffset < 2 ? 2 : _rtspScanOffset,
+        );
         if (end < 0) {
-          if (_rtspBuffer.length > 8 * 1024 * 1024) {
-            _rtspBuffer.removeRange(0, _rtspBuffer.length - 2);
+          if (_rtspBufferLength > _rtspMaxFrameBytes) {
+            // Không JPEG preview nào lớn thế này -> đã mất đồng bộ. Xả SẠCH.
+            // Bản cũ giữ lại 2 byte cuối, và chính 2 byte rác đó lại nằm
+            // trước SOI của frame kế tiếp.
+            debugPrint(
+              'RTSP: buffer $_rtspBufferLength byte không tìm thấy EOI, '
+              'xả buffer để đồng bộ lại',
+            );
+            _resetRtspBuffer();
+            break;
           }
-          return;
+          // Nhớ đã quét tới đâu để chunk sau không quét lại từ đầu. Lùi 1
+          // byte vì marker có thể vắt qua ranh giới hai chunk.
+          _rtspScanOffset = _rtspBufferLength > 1 ? _rtspBufferLength - 1 : 2;
+          break;
         }
 
-        final frame = Uint8List.fromList(_rtspBuffer.sublist(0, end + 2));
-        _rtspBuffer.removeRange(0, end + 2);
-        _setCurrentFrame(frame);
+        final frame = Uint8List(end + 2);
+        frame.setRange(0, end + 2, _rtspBuffer);
+        latestFrame = frame;
+
+        _discardRtspBufferFront(end + 2);
+        _rtspScanOffset = 0;
+      }
+
+      if (latestFrame != null) {
+        // Đã nhận được frame thật -> luồng lành, reset backoff để lần chết
+        // sau được thử lại ngay từ 2s chứ không kế thừa delay 30s cũ.
+        _rtspRetryAttempt = 0;
+        _setCurrentFrame(latestFrame);
       }
     } catch (e) {
       _lastError = 'RTSP frame parse error: $e';
@@ -455,18 +683,50 @@ class AutoVRSWebSocketService extends ChangeNotifier {
     }
   }
 
-  int _indexOfJpegMarker(
-    List<int> bytes,
-    int first,
-    int second,
-    int startIndex,
-  ) {
-    for (var i = startIndex; i < bytes.length - 1; i++) {
-      if (bytes[i] == first && bytes[i + 1] == second) {
+  /// Tìm marker JPEG `0xFF <second>` trong phần đang dùng của [_rtspBuffer].
+  int _indexOfRtspMarker(int second, int startIndex) {
+    final buffer = _rtspBuffer;
+    final limit = _rtspBufferLength - 1;
+    for (var i = startIndex; i < limit; i++) {
+      if (buffer[i] == 0xff && buffer[i + 1] == second) {
         return i;
       }
     }
     return -1;
+  }
+
+  void _appendToRtspBuffer(List<int> chunk) {
+    final needed = _rtspBufferLength + chunk.length;
+    if (needed > _rtspBuffer.length) {
+      var capacity = _rtspBuffer.isEmpty ? 128 * 1024 : _rtspBuffer.length;
+      while (capacity < needed) {
+        capacity *= 2;
+      }
+      final grown = Uint8List(capacity);
+      grown.setRange(0, _rtspBufferLength, _rtspBuffer);
+      _rtspBuffer = grown;
+    }
+    _rtspBuffer.setRange(_rtspBufferLength, needed, chunk);
+    _rtspBufferLength = needed;
+  }
+
+  /// Bỏ [count] byte đầu buffer, dồn phần còn lại về đầu.
+  void _discardRtspBufferFront(int count) {
+    if (count <= 0) return;
+    if (count >= _rtspBufferLength) {
+      _resetRtspBuffer();
+      return;
+    }
+    // setRange trên cùng một Uint8List có ngữ nghĩa memmove nên phần chồng
+    // lấn được xử lý đúng.
+    _rtspBuffer.setRange(0, _rtspBufferLength - count, _rtspBuffer, count);
+    _rtspBufferLength -= count;
+    _rtspScanOffset = _rtspScanOffset > count ? _rtspScanOffset - count : 0;
+  }
+
+  void _resetRtspBuffer() {
+    _rtspBufferLength = 0;
+    _rtspScanOffset = 0;
   }
 
   /// Xử lý message từ server
@@ -514,17 +774,30 @@ class AutoVRSWebSocketService extends ChangeNotifier {
               debugPrint('📩 Message type/command: $type');
             }
           } else {
-            debugPrint('❌ JSON không phải Map: $data');
+            debugPrint('❌ JSON không phải Map: ${_previewForLog(data)}');
           }
         } catch (e) {
-          debugPrint('❌ Không parse được JSON: $message');
+          // Cắt ngắn: message có thể là 1 frame JPEG base64 vài trăm KB.
+          debugPrint('❌ Không parse được JSON: ${_previewForLog(message)}');
         }
       } else {
-        debugPrint('❓ Message không xác định kiểu: $message');
+        debugPrint(
+          '❓ Message không xác định kiểu: ${_previewForLog(message)}',
+        );
       }
     } catch (e) {
       debugPrint('❌ Lỗi khi xử lý message: $e');
     }
+  }
+
+  /// Rút ngắn 1 payload để đưa vào log.
+  ///
+  /// Message trên kênh này có thể là 1 khung JPEG base64 vài trăm KB; in thẳng
+  /// ra console vừa không đọc được vừa làm chậm cả app.
+  static String _previewForLog(Object? value, {int maxChars = 200}) {
+    final text = value?.toString() ?? 'null';
+    if (text.length <= maxChars) return text;
+    return '${text.substring(0, maxChars)}... (${text.length} ký tự)';
   }
 
   /// Xử lý video frame với base64 JPEG từ ngrok
@@ -577,15 +850,9 @@ class AutoVRSWebSocketService extends ChangeNotifier {
       // DEBUG: Log detection data
       if (_lastDetectionResults != null) {
         final numDefects = _lastDetectionResults!['num_defects'] ?? 0;
-        final detections = _lastDetectionResults!['detections'] as List?;
+        // Chỉ log số lượng. In cả list (và từng phần tử) làm console không đọc
+        // được, mà bản thân payload có thể mang ảnh base64.
         debugPrint('🔍 DETECTION DATA: $numDefects defects found');
-        debugPrint('🔍 Detection list: $detections');
-
-        if (detections != null) {
-          for (int i = 0; i < detections.length; i++) {
-            debugPrint('🔍 Defect $i: ${detections[i]}');
-          }
-        }
       } else {
         debugPrint('🔍 NO DETECTION RESULTS in response');
       }
@@ -750,21 +1017,31 @@ class AutoVRSWebSocketService extends ChangeNotifier {
     }
 
     // SICK camera mode: Capture current frame and send to AI API
-    if (_currentFrame == null) {
+    final previewFrame = _currentFrame;
+    if (previewFrame == null) {
       debugPrint('📤 ERROR: No current frame available');
       throw Exception('No frame available to capture');
     }
 
     try {
+      // Với RTSP, frame preview đã bị scale xuống `rtspPreviewWidth` nên
+      // không dùng được làm input cho AI. Lấy riêng một khung full-res; nếu
+      // không lấy được thì mới đành dùng frame preview.
+      final fullFrame = await grabFullResolutionFrame();
+      final frameToCapture = fullFrame ?? previewFrame;
+
       // Save current frame as captured image
-      _setCapturedImage(_currentFrame);
+      _setCapturedImage(frameToCapture);
       _setViewingCapturedImage(true);
 
-      debugPrint('📸 Frame captured (${_currentFrame!.length} bytes)');
+      debugPrint(
+        '📸 Frame captured (${frameToCapture.length} bytes, '
+        '${fullFrame != null ? 'full-res' : 'preview'})',
+      );
 
       // Send to AI detection API if enabled
       if (enableDetection) {
-        await _sendToAIDetection(_currentFrame!);
+        await _sendToAIDetection(frameToCapture);
       }
 
       _notifyListenersIfAlive();
@@ -773,6 +1050,70 @@ class AutoVRSWebSocketService extends ChangeNotifier {
       debugPrint('❌ Capture error: $e');
       _notifyListenersIfAlive();
       rethrow;
+    }
+  }
+
+  /// Chụp 1 khung ở ĐỘ PHÂN GIẢI GỐC từ RTSP bằng một ffmpeg one-shot.
+  ///
+  /// Luồng preview bị scale xuống [rtspPreviewWidth] để không làm nghẽn pipe
+  /// stdout (xem ghi chú ở [rtspPreviewWidth]), nhưng ảnh đưa vào AI detection
+  /// thì phải là ảnh gốc: lỗi mạch cỡ vài chục micromet biến mất khi ảnh bị
+  /// thu nhỏ 2 lần. Tiến trình này chỉ sống vài trăm ms mỗi lần người dùng bấm
+  /// chụp nên không ảnh hưởng tới luồng preview đang chạy.
+  ///
+  /// Trả `null` nếu nguồn video không phải RTSP hoặc không lấy được khung -
+  /// caller tự fallback sang frame preview.
+  Future<Uint8List?> grabFullResolutionFrame() async {
+    if (_streamSource != AutoVRSStreamSource.rtsp) return null;
+    if (_rtspUrl.isEmpty || _ffmpegPath.isEmpty) return null;
+
+    Process? process;
+    try {
+      process = await Process.start(_ffmpegPath, <String>[
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-rtsp_transport',
+        'tcp',
+        '-i',
+        _rtspUrl,
+        '-frames:v',
+        '1',
+        '-an',
+        '-f',
+        'image2pipe',
+        '-vcodec',
+        'mjpeg',
+        '-q:v',
+        '2',
+        'pipe:1',
+      ]).timeout(const Duration(seconds: 8));
+
+      // stderr phải được drain, nếu không ffmpeg có thể block khi ghi log và
+      // treo luôn cả việc ghi stdout.
+      final stderrDrained = process.stderr.drain<void>().catchError((_) {});
+
+      final builder = BytesBuilder(copy: false);
+      await process.stdout
+          .forEach(builder.add)
+          .timeout(const Duration(seconds: 12));
+      await stderrDrained;
+
+      final bytes = builder.takeBytes();
+      if (bytes.length < 4 || bytes[0] != 0xff || bytes[1] != 0xd8) {
+        debugPrint(
+          'RTSP snapshot: dữ liệu trả về không phải JPEG '
+          '(${bytes.length} byte), dùng frame preview',
+        );
+        return null;
+      }
+      debugPrint('RTSP snapshot: lấy được khung full-res ${bytes.length} byte');
+      return bytes;
+    } catch (e) {
+      debugPrint('RTSP snapshot thất bại ($e), dùng frame preview');
+      return null;
+    } finally {
+      process?.kill();
     }
   }
 
@@ -805,8 +1146,9 @@ class AutoVRSWebSocketService extends ChangeNotifier {
         _lastAnalysis = data['statistics'] as Map<String, dynamic>?;
 
         final numDefects = (data['detections'] as List?)?.length ?? 0;
+        // KHÔNG log cả `data`: response chứa `processed_image_base64`, in ra là
+        // đổ vài trăm KB base64 vào console mỗi lần chụp.
         debugPrint('✅ AI Detection complete: $numDefects defects');
-        debugPrint('🔍 Detection data: $data');
 
         _notifyListenersIfAlive();
       } else {
@@ -920,6 +1262,8 @@ class AutoVRSWebSocketService extends ChangeNotifier {
     _isDisposed = true;
     _connectionToken++;
     _notifierUpdateToken++;
+    _rtspStoppedByUser = true;
+    _cancelRtspRetry();
     _subscription?.cancel();
     _rtspStdoutSubscription?.cancel();
     _rtspStderrSubscription?.cancel();
@@ -944,7 +1288,8 @@ class AutoVRSWebSocketService extends ChangeNotifier {
     _lastDetectionResults = null;
     _lastAnalysis = null;
     _capturedDetections = null;
-    _rtspBuffer.clear();
+    _rtspBuffer = Uint8List(0);
+    _resetRtspBuffer();
 
     super.dispose();
     debugPrint('🗑️ AutoVRSWebSocketService disposed and cleaned up');

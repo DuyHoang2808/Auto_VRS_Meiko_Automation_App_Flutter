@@ -3,6 +3,47 @@ import 'package:path/path.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:io';
 
+/// 1 lỗi đã được phán định chưa (auto hoặc thủ công đều ghi vào `judgement`).
+///
+/// AOI_Ingest chèn lỗi mà KHÔNG ghi cột `judgement` (xem `insert_defects` trong
+/// aoi_ingest_service.py) nên lỗi mới luôn có `judgement IS NULL`. Đây là nguồn
+/// sự thật để biết soi tới đâu - thay cho biến đếm trong state của widget, vốn
+/// mất sạch khi màn hình bị dispose lúc chuyển tab.
+bool isDefectJudged(Map<String, dynamic> defect) {
+  final j = defect['judgement']?.toString().trim();
+  return j != null && j.isNotEmpty;
+}
+
+/// Vị trí lỗi CHƯA phán định đầu tiên, hoặc -1 nếu đã phán định hết.
+///
+/// Dùng thay cho việc luôn bắt đầu từ index 0: nó tự động bỏ qua các lỗi đã
+/// phán định ở lượt trước hoặc do VRS thủ công phán định (kể cả phán định
+/// không theo thứ tự, vì màn thủ công cho phép nhảy tới lỗi bất kỳ).
+int firstUnjudgedDefectIndex(List<Map<String, dynamic>> defects) {
+  return defects.indexWhere((d) => !isDefectJudged(d));
+}
+
+/// Loại lỗi để HIỂN THỊ cho người vận hành từ 1 dòng `tbDefect`.
+///
+/// Ưu tiên `ai_type` (loại lỗi AI/người vận hành nhận định lúc soi), fallback
+/// `type`. Lý do thứ tự này:
+/// - `ai_type` là kết quả phán định - đúng thứ người vận hành cần thấy trong
+///   bảng trạng thái, và `_getDefectDisplayName()` dịch được sang tên tiếng Việt.
+/// - `type` là mã SỐ thô do máy AOI xuất ra (`str(type_code)`, ví dụ `"2"`,
+///   xem `insert_defects` trong aoi_ingest_service.py) và KHÔNG có bảng ánh xạ
+///   sang tên lỗi ở đâu trong hệ thống, nên hiện thẳng ra thì vô nghĩa.
+///   Chỉ dùng cho lỗi chưa soi (chưa có `ai_type`).
+///
+/// Lưu ý: `type` vẫn là nguồn sự thật của AOI trong DB và KHÔNG ai được ghi đè -
+/// `getDefectStatistics()` (`GROUP BY type`) dựa vào nó để truy vết. Hàm này chỉ
+/// quyết định *hiển thị*, không quyết định *lưu trữ*.
+String? defectTypeForDisplay(Map<String, dynamic> defect) {
+  final aiType = defect['ai_type']?.toString();
+  if (aiType != null && aiType.isNotEmpty) return aiType;
+  final aoiType = defect['type']?.toString();
+  return (aoiType != null && aoiType.isNotEmpty) ? aoiType : null;
+}
+
 class LocalDatabaseService {
   static final LocalDatabaseService _instance =
       LocalDatabaseService._internal();
@@ -279,9 +320,12 @@ class LocalDatabaseService {
         }
       }
 
-      // Kiểm tra tbDefect có cột plc_coor chưa. Cột này lưu tọa độ đã quy đổi
-      // sang hệ PLC (định dạng "x;y", ví dụ "19.887;5.86") — vrs_main_screen.dart
-      // và manual_vrs_screen.dart đọc trực tiếp cột này để di chuyển camera.
+      // Kiểm tra tbDefect có cột plc_coor chưa. Cột này lưu tọa độ Board
+      // (Gerber/design, CHƯA quy đổi sang PLC — định dạng "x;y", ví dụ
+      // "19.887;5.86"). vrs_main_screen.dart và manual_vrs_screen.dart đọc
+      // trực tiếp cột này rồi gửi cho gateway (/api/inspect-defect hoặc
+      // /api/plc/move_bulech) để tự board_to_plc + bù lệch board trước khi
+      // gửi PLC thật — KHÔNG gửi thẳng giá trị này cho PLC.
       final defectInfo = await db.rawQuery("PRAGMA table_info(tbDefect)");
       final hasPlcCoor = defectInfo.any((col) => col['name'] == 'plc_coor');
 
@@ -292,6 +336,23 @@ class LocalDatabaseService {
           debugPrint('✅ Migration completed: plc_coor column added');
         } catch (e) {
           debugPrint('⚠️ Could not add plc_coor to tbDefect: $e');
+        }
+      }
+
+      // Cột ai_type: loại lỗi do AI/người vận hành phán định lại khi soi.
+      // Trước đây kết quả này bị ghi ĐÈ lên cột `type` (loại lỗi gốc từ AOI),
+      // nên mỗi lỗi OK sẽ biến `type` thành 'none' và mất vĩnh viễn loại lỗi
+      // AOI báo — làm sai thống kê (getDefectStatistics GROUP BY type) và làm
+      // sai request Gerber (dùng defect['type'] làm defectType). Từ nay:
+      //   type    = loại lỗi AOI báo, CHỈ AOI_Ingest ghi, không ai ghi đè
+      //   ai_type = loại lỗi AI/người vận hành nhận định khi soi
+      if (!defectInfo.any((col) => col['name'] == 'ai_type')) {
+        debugPrint('⚠️ Migration: Adding ai_type column to tbDefect');
+        try {
+          await db.execute('ALTER TABLE tbDefect ADD COLUMN ai_type TEXT');
+          debugPrint('✅ Migration completed: ai_type column added');
+        } catch (e) {
+          debugPrint('⚠️ Could not add ai_type to tbDefect: $e');
         }
       }
 
@@ -332,6 +393,7 @@ class LocalDatabaseService {
         CREATE TABLE tbDefect_new (
           id_defect INTEGER PRIMARY KEY AUTOINCREMENT,
           type TEXT,
+          ai_type TEXT,
           judgement TEXT,
           height REAL,
           width REAL,
@@ -348,6 +410,7 @@ class LocalDatabaseService {
         INSERT INTO tbDefect_new (
           id_defect,
           type,
+          ai_type,
           judgement,
           height,
           width,
@@ -360,6 +423,7 @@ class LocalDatabaseService {
         SELECT
           id_defect,
           type,
+          ai_type,
           judgement,
           height,
           width,
@@ -419,6 +483,7 @@ class LocalDatabaseService {
       CREATE TABLE IF NOT EXISTS tbDefect (
         id_defect INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT,
+        ai_type TEXT,
         judgement TEXT,
         height REAL,
         width REAL,
@@ -473,6 +538,21 @@ class LocalDatabaseService {
   Future<int> deleteModel(int id) async {
     final db = await database;
     return await db.delete('tbModel', where: 'id_model = ?', whereArgs: [id]);
+  }
+
+  /// Update line_size/space_size of an existing model. Returns number of rows updated.
+  Future<int> updateModelSizes(
+    int idModel, {
+    required double lineSize,
+    required double spaceSize,
+  }) async {
+    final db = await database;
+    return await db.update(
+      'tbModel',
+      {'line_size': lineSize, 'space_size': spaceSize},
+      where: 'id_model = ?',
+      whereArgs: [idModel],
+    );
   }
 
   Future<Map<String, dynamic>?> getModelById(int id) async {
@@ -550,6 +630,38 @@ class LocalDatabaseService {
       whereArgs: [idBoard],
     );
     return results.isNotEmpty ? results.first : null;
+  }
+
+  /// Xoá hết phán định của 1 board để soi lại từ đầu ("Board đã bị động, calib
+  /// lại" / "Soi lại từ đầu").
+  ///
+  /// Cần thiết vì tiến độ được suy ra từ `judgement`: nếu không xoá thì
+  /// "soi lại từ đầu" sẽ vẫn nhảy tới lỗi chưa phán định đầu tiên, tức không
+  /// soi lại gì cả. Đồng thời đưa board về 'pending' vì `getNextPendingBoard`
+  /// và `getFirstBoardByLotId` đều lọc bỏ board 'completed' - không reset thì
+  /// board đã hoàn tất sẽ không bao giờ chọn lại được.
+  ///
+  /// CHỈ xoá `judgement` (+ `ai_type`, `time`): `type` là loại lỗi gốc do AOI
+  /// ghi nên phải giữ nguyên.
+  Future<void> resetBoardForReinspection(int idBoard) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final rows = await txn.update(
+        'tbDefect',
+        {'judgement': null, 'ai_type': null, 'time': null},
+        where: 'tbBoardid_board = ?',
+        whereArgs: [idBoard],
+      );
+      await txn.update(
+        'tbBoard',
+        {'status': 'pending', 'completed_at': null},
+        where: 'id_board = ?',
+        whereArgs: [idBoard],
+      );
+      debugPrint(
+        '♻️ Reset board $idBoard de kiem tra lai: xoa phan dinh cua $rows loi',
+      );
+    });
   }
 
   /// Đánh dấu 1 board đã xử lý xong (hết lỗi, đã judgement). Dùng bởi

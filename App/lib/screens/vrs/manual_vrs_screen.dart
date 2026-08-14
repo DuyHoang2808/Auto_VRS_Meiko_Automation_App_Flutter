@@ -32,6 +32,12 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
   List<Map<String, dynamic>> _defects = [];
   int _defectListReloadToken = 0;
   String? _currentBoardId;
+  // Tăng mỗi lần bắt đầu load danh sách lỗi; lần load nào có token cũ thì bỏ
+  // kết quả, tránh 2 lần load chồng nhau hoàn tất trái thứ tự.
+  int _loadDefectsToken = 0;
+  // Provider được giữ lại để bỏ listener trong dispose (không đọc context ở
+  // dispose vì lúc đó cây widget đã tháo).
+  VRSProvider? _vrsProvider;
   final _db = LocalDatabaseService();
 
   // Streamlined state management for capture + AI detection
@@ -46,6 +52,13 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
   bool _isSendingCoords = false;
   // Auto board offset calibration
   bool _calibrating = false;
+  // Mặt đang được calib - phải hiện cho operator biết, vì khi calib trong lúc
+  // "Chuyển Bo" thì đó là mặt của board ĐÍCH, khác mặt đang hiển thị ở trên.
+  String? _calibratingSide;
+  // Đang trong chuỗi "Chuyển Bo" (hỏi xác nhận -> calib -> đổi board). Phải là
+  // cờ riêng, không dùng _calibrating: chuỗi này còn bao cả phần hỏi/đổi board
+  // ngoài giai đoạn calib.
+  bool _advancingBoard = false;
 
   // Capture state management
   bool _isAnalyzing = false;
@@ -72,6 +85,11 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
     // _videoFrameService = VideoFrameService(); // Disabled
     _gerberService = context.read<QCamberGerberService>();
 
+    // Đăng ký listener tường minh để bắt được thay đổi board từ provider
+    // (didChangeDependencies không đủ - xem _syncBoardFromProvider).
+    _vrsProvider = context.read<VRSProvider>();
+    _vrsProvider!.addListener(_syncBoardFromProvider);
+
     // Kết nối AutoVRS WebSocket khi khởi tạo màn hình
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -92,22 +110,39 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Watch for board changes from provider and reload defects when board changes
-    final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
-    final board = vrsProvider.currentBoard;
-    if (board != _currentBoardId) {
-      _currentBoardId = board;
-      // Use post-frame callback to avoid calling setState during build
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _loadDefectsForBoard(board);
-      });
-    }
+    _syncBoardFromProvider();
+  }
+
+  /// Đồng bộ board đang xem theo `VRSProvider.currentBoard`.
+  ///
+  /// Được gọi từ listener đăng ký trong [initState]. Trước đây chỉ nằm trong
+  /// `didChangeDependencies` với `Provider.of(listen: false)` - không đăng ký
+  /// dependency nào nên KHÔNG bao giờ chạy lại; chỗ đọc `listen: true` duy nhất
+  /// lại nằm trong context của `LayoutBuilder` (rebuild subtree đó, không gọi
+  /// `didChangeDependencies` của State). Việc đồng bộ board chỉ "tình cờ" hoạt
+  /// động nhờ màn hình bị dispose + tạo lại mỗi lần điều hướng.
+  void _syncBoardFromProvider() {
+    if (!mounted) return;
+    final board = Provider.of<VRSProvider>(context, listen: false).currentBoard;
+    if (board == _currentBoardId) return;
+    _currentBoardId = board;
+    // Post-frame để không setState giữa lúc build (listener có thể được gọi
+    // trong lúc provider notify ở giữa một frame).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loadDefectsForBoard(board);
+    });
   }
 
   Future<void> _loadDefectsForBoard(
     String? boardIdStr, {
     int? selectedDefectId,
   }) async {
+    // Token chống race: 2 lần load chồng nhau có thể hoàn tất trái thứ tự, để
+    // lại `_defects` của board cũ trong khi `_currentBoardId` đã là board mới.
+    // Hậu quả thật: `_moveCameraToDefect` ghép boardId mới với plc_coor cũ ->
+    // PLC chạy tới toạ độ của board khác.
+    final myToken = ++_loadDefectsToken;
+
     final id = int.tryParse(boardIdStr ?? '');
     if (id == null) {
       if (!mounted) return;
@@ -119,6 +154,7 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
         _aoiImageError = null;
         _aoiImageIsNetwork = false;
       });
+      _resetJudgementState();
       // Schedule clearImage after build to avoid setState during build
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _gerberService.clearImage();
@@ -127,7 +163,10 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
     }
 
     final list = await _db.getDefectsByBoard(id);
-    if (!mounted) return;
+    if (!mounted || myToken != _loadDefectsToken) return;
+    // Đổi board -> bỏ mọi phán định/ảnh chụp còn treo của board cũ, nếu không
+    // `_makeJudgment` sẽ gắn loại lỗi AI và ảnh của board cũ cho lỗi board mới.
+    if (selectedDefectId == null) _resetJudgementState();
     setState(() {
       _defects = list;
       if (_defects.isEmpty) {
@@ -245,8 +284,10 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
     try {
       final defect = _defects[_currentDefectIndex];
 
-      // Extract PLC coordinates (already scaled)
-      double x = 0.0, y = 0.0;
+      // plc_coor lưu toạ độ Board (Gerber/design), CHƯA quy đổi sang PLC -
+      // xem comment ở local_database_service.dart. Gateway sẽ tự board_to_plc +
+      // bù lệch board (giống hệt luồng /api/inspect-defect của Auto VRS).
+      double boardX = 0.0, boardY = 0.0;
       final plcCoordStr = defect['plc_coor'] as String?;
 
       if (plcCoordStr != null && plcCoordStr.isNotEmpty) {
@@ -255,8 +296,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
           if (plcCoordStr.contains(';')) {
             final parts = plcCoordStr.split(';');
             if (parts.length >= 2) {
-              x = double.tryParse(parts[0].trim()) ?? 0.0;
-              y = double.tryParse(parts[1].trim()) ?? 0.0;
+              boardX = double.tryParse(parts[0].trim()) ?? 0.0;
+              boardY = double.tryParse(parts[1].trim()) ?? 0.0;
             }
           }
         } catch (e) {
@@ -264,7 +305,7 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
         }
       }
 
-      if (x == 0.0 && y == 0.0) {
+      if (boardX == 0.0 && boardY == 0.0) {
         throw Exception('Toa do loi khong hop le (0,0)');
       }
 
@@ -274,16 +315,22 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
           ? rawDefectId
           : int.tryParse(rawDefectId.toString()) ?? 0;
 
+      final vrs = Provider.of<VRSProvider>(context, listen: false);
+      final boardSide = vrs.currentBoardSide;
+
       debugPrint(
-        '📤 Moving PLC via Gateway API: board=$boardId, defect=$defectId, x=$x, y=$y',
+        '📤 Moving PLC via Gateway API (move_bulech): board=$boardId, '
+        'defect=$defectId, boardXY=($boardX,$boardY), side=$boardSide',
       );
 
-      // Move camera via direct HTTP call to plc_gateway_api.py (/api/plc/move),
-      // replacing the old CoordWsClient -> ws_coord_server.py relay.
-      final result = await _plcGateway.movePlc(
-        x: x,
-        y: y,
-        boardId: boardId,
+      // Move camera qua /api/plc/move_bulech: gateway tự board_to_plc + bù
+      // lệch board trước khi gửi PLC — thay cho /api/plc/move (gửi thô, không
+      // mapping/không bù lệch).
+      final result = await _plcGateway.movePlcWithOffset(
+        boardX: boardX,
+        boardY: boardY,
+        boardSide: boardSide,
+        boardId: boardId.toString(),
         defectId: defectId,
       );
 
@@ -292,13 +339,33 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
       setState(() => _isSendingCoords = false);
 
       if (result.success) {
-        scaffoldMessengerKey.currentState?.showSnackBar(
-          SnackBar(
-            content: Text('Da di chuyen toi ($x, $y)'),
-            backgroundColor: Colors.green,
-            duration: const Duration(seconds: 2),
-          ),
-        );
+        if (result.offsetApplied) {
+          scaffoldMessengerKey.currentState?.showSnackBar(
+            SnackBar(
+              content: Text(
+                'Da di chuyen toi PLC (${result.plcX?.toStringAsFixed(3)}, '
+                '${result.plcY?.toStringAsFixed(3)}) - da bu lech mat $boardSide',
+              ),
+              backgroundColor: Colors.green,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        } else {
+          // Chưa có offset_runtime cho mặt board này - cảnh báo rõ để operator
+          // biết toạ độ có thể lệch, cần calib trước.
+          scaffoldMessengerKey.currentState?.showSnackBar(
+            SnackBar(
+              content: Text(
+                '⚠️ Da di chuyen toi PLC (${result.plcX?.toStringAsFixed(3)}, '
+                '${result.plcY?.toStringAsFixed(3)}) NHUNG CHUA bu lech board '
+                'mat $boardSide - toa do co the khong chinh xac. Hay bam '
+                '"Calib bù lệch board" truoc khi kiem tra.',
+              ),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
         debugPrint('✅ Move to defect completed: ${result.message}');
       } else {
         scaffoldMessengerKey.currentState?.showSnackBar(
@@ -329,16 +396,76 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
   /// Calib bù lệch thủ công — operator bấm khi muốn re-calib board hiện tại.
   Future<void> _triggerManualCalibration() async {
     final vrs = Provider.of<VRSProvider>(context, listen: false);
-    setState(() => _calibrating = true);
+    final targetBoardId =
+        vrs.currentBoard.isNotEmpty && vrs.currentBoard != 'Chưa có'
+        ? vrs.currentBoard
+        : '';
+
+    // Đang có board kế chờ chuyển: nút này vẫn calib cho board HIỆN TẠI (mặt
+    // hiện tại), nên nếu operator vừa lật bo / đổi bo thì calib này sai board
+    // lẫn sai mặt, và sẽ bị "Chuyển Bo" calib lại. Hỏi trước cho rõ.
+    if (vrs.nextBoardAvailable) {
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Đang chờ chuyển bo'),
+          content: Text(
+            'Nút này calib cho board đang mở ($targetBoardId - mặt '
+            '${vrs.currentBoardSide}), KHÔNG phải board kế tiếp '
+            '(${vrs.nextBoardId} - mặt ${vrs.nextBoardSide}).\n\n'
+            'Nếu bạn vừa lật bo / đặt bo mới thì hãy bấm "Chuyển Bo" - thao tác '
+            'đó tự calib đúng cho board kế tiếp.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Để tôi bấm "Chuyển Bo"'),
+            ),
+            OutlinedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Vẫn calib board hiện tại'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true || !mounted) return;
+    }
+
+    await _runCalibration(boardId: targetBoardId, side: vrs.currentBoardSide);
+  }
+
+  /// Chạy calib bù lệch cho board [boardId] mặt [side]. Trả `true` nếu thành
+  /// công (đã ghi nhận lên provider), `false` nếu thất bại.
+  ///
+  /// Tách riêng khỏi [_triggerManualCalibration] để chuỗi "Chuyển Bo" dùng lại
+  /// được: khi đổi board/mặt thì phải calib cho board ĐÍCH, không phải board
+  /// hiện tại (nếu ghi nhận sai id_board thì `isCalibratedFor` ở tab Auto sẽ
+  /// khớp sai và bỏ qua calib cho board thực sự mới).
+  Future<bool> _runCalibration({
+    required String boardId,
+    required String side,
+  }) async {
+    final vrs = Provider.of<VRSProvider>(context, listen: false);
+    setState(() {
+      _calibrating = true;
+      _calibratingSide = side;
+    });
 
     final result = await _plcGateway.triggerAutoBoardOffset(
-      boardSide: vrs.currentBoardSide,
+      boardSide: side,
+      boardId: boardId.isNotEmpty ? boardId : null,
     );
 
-    if (!mounted) return;
-    setState(() => _calibrating = false);
+    if (!mounted) return false;
+    setState(() {
+      _calibrating = false;
+      _calibratingSide = null;
+    });
 
     if (result.success) {
+      // Ghi nhận lên provider để tab Auto VRS công nhận lần calib này và không
+      // bắt operator calib lại khi quay về bấm "Bắt đầu".
+      vrs.markCalibrated(boardId: boardId, side: side);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -351,15 +478,17 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
           duration: const Duration(seconds: 4),
         ),
       );
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Calib thất bại: ${result.message}'),
-          backgroundColor: Colors.red,
-          duration: const Duration(seconds: 4),
-        ),
-      );
+      return true;
     }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Calib thất bại: ${result.message}'),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 4),
+      ),
+    );
+    return false;
   }
 
   void _changeResolution(String resolution) {
@@ -451,25 +580,30 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
           context,
           listen: false,
         );
-        currentFrame = webSocketService.currentFrame; // Lấy frame live hiện tại
-
-        // Lưu captured frame và dừng live stream
-        if (currentFrame != null) {
-          // Set captured image và chuyển sang chế độ xem captured
-          _latestCapturedFrame = Uint8List.fromList(currentFrame);
-          webSocketService.setCapturedImage(currentFrame);
-          webSocketService.setViewingCapturedImage(true);
-        }
-
-        // Also trigger capture for AutoVRS system
+        // CHỈ chụp 1 lần. Trước đây khối này chốt ảnh từ frame preview trước,
+        // rồi `captureImage()` lại chụp thêm 1 khung full-res và ghi đè lên -
+        // operator thấy ảnh nhảy 2 lần, đúng như "bị chụp 2 lần".
+        //
+        // enableDetection: false vì màn này TỰ gọi AI ở dưới bằng
+        // `_aiDetectionService` (kết quả đó mới là cái hiển thị lên UI). Bật lên
+        // là gửi CÙNG một ảnh cho API detection 2 lần, đồng thời ghi kết quả vào
+        // `lastDetectionResults` của service app-scoped -> tab Auto VRS hiện lẫn
+        // kết quả của board đang phán định thủ công.
         final timestamp = DateTime.now().millisecondsSinceEpoch;
         final filename = 'defect_${_currentDefectIndex + 1}_$timestamp.jpg';
         await webSocketService.captureImage(
           filename: filename,
-          enableDetection: true,
+          enableDetection: false,
         );
-        // Get current frame from AutoVRS WebSocket service
-        currentFrame = webSocketService.currentFrame;
+        if (!mounted) return;
+        // `captureImage` đã setCapturedImage + chuyển sang xem ảnh chụp. Lấy
+        // đúng ảnh nó chốt: ở nguồn RTSP frame live bị scale xuống
+        // AutoVRSWebSocketService.rtspPreviewWidth cho nhẹ pipe, còn
+        // `capturedImage` là khung full-res - đó mới là ảnh nên đưa vào AI.
+        currentFrame = webSocketService.capturedImage;
+        if (currentFrame != null) {
+          _latestCapturedFrame = currentFrame;
+        }
       }
 
       if (currentFrame == null) {
@@ -513,9 +647,22 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
 
   @override
   void dispose() {
+    _vrsProvider?.removeListener(_syncBoardFromProvider);
     _aiDetectionService.dispose();
     // _videoFrameService.dispose(); // Disabled - using AutoVRSWebSocketService
     super.dispose();
+  }
+
+  /// Xoá phán định / kết quả AI / ảnh chụp còn treo. Gọi khi đổi board và sau
+  /// khi lưu phán định, để không mang state của lỗi (hoặc board) cũ sang lỗi mới.
+  void _resetJudgementState() {
+    if (!mounted) return;
+    setState(() {
+      _pendingJudgement = null;
+      _analysisResult = null;
+      _hasAnalysisResult = false;
+      _latestCapturedFrame = null;
+    });
   }
 
   @override
@@ -590,7 +737,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                             IconButton(
                                               onPressed:
                                                   _defects.isNotEmpty &&
-                                                      _currentDefectIndex > 0
+                                                      _currentDefectIndex > 0 &&
+                                                      !_isSendingCoords
                                                   ? _previousDefect
                                                   : null,
                                               icon: const Icon(
@@ -605,7 +753,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                               onPressed:
                                                   _defects.isNotEmpty &&
                                                       _currentDefectIndex <
-                                                          _defects.length - 1
+                                                          _defects.length - 1 &&
+                                                      !_isSendingCoords
                                                   ? _nextDefect
                                                   : null,
                                               icon: const Icon(
@@ -704,6 +853,28 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                               availableWidth < availableHeight
                                               ? availableWidth
                                               : availableHeight;
+                                          // Kích thước DECODE của ảnh preview.
+                                          // `width`/`height` của Image chỉ là
+                                          // kích thước vẽ - không có
+                                          // cacheHeight thì mỗi frame vẫn
+                                          // decode ở nguyên độ phân giải
+                                          // nguồn (1080p = 8,3 MB bitmap),
+                                          // 15 lần/giây, để rồi vẽ vào ô vài
+                                          // trăm px. Chỉ đặt cacheHeight
+                                          // (không đặt cả hai chiều): dart:ui
+                                          // giữ đúng tỉ lệ khi chỉ có một
+                                          // chiều, đặt cả hai sẽ bóp méo ảnh.
+                                          // Nhân theo mức phóng đại để zoom
+                                          // không bị mờ; ResizeImage tự kẹp
+                                          // lại nếu vượt kích thước nguồn.
+                                          final previewDecodeHeight =
+                                              squareSize.isFinite &&
+                                                  squareSize > 0
+                                              ? (squareSize *
+                                                        (_magnification / 100.0)
+                                                            .clamp(1.0, 8.0))
+                                                    .round()
+                                              : null;
 
                                           return Center(
                                             child: SizedBox(
@@ -768,6 +939,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                                                       squareSize,
                                                                   height:
                                                                       squareSize,
+                                                                  cacheHeight:
+                                                                      previewDecodeHeight,
                                                                   gaplessPlayback:
                                                                       true,
                                                                 ),
@@ -804,6 +977,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                                                       squareSize,
                                                                   height:
                                                                       squareSize,
+                                                                  cacheHeight:
+                                                                      previewDecodeHeight,
                                                                   gaplessPlayback:
                                                                       true, // Optimize for smooth video playback
                                                                 ),
@@ -835,6 +1010,8 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                                                       squareSize,
                                                                   height:
                                                                       squareSize,
+                                                                  cacheHeight:
+                                                                      previewDecodeHeight,
                                                                   gaplessPlayback:
                                                                       true, // Optimize for smooth video playback
                                                                 ),
@@ -1191,20 +1368,46 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                 SizedBox(
                                   width: double.infinity,
                                   child: _calibrating
-                                      ? const Padding(
-                                          padding: EdgeInsets.symmetric(vertical: 8),
-                                          child: Center(
-                                            child: SizedBox(
-                                              height: 20,
-                                              width: 20,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
+                                      ? Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            vertical: 8,
+                                          ),
+                                          child: Row(
+                                            mainAxisAlignment:
+                                                MainAxisAlignment.center,
+                                            children: [
+                                              const SizedBox(
+                                                height: 16,
+                                                width: 16,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                      strokeWidth: 2,
+                                                    ),
                                               ),
-                                            ),
+                                              const SizedBox(width: 8),
+                                              // Nói rõ đang calib mặt nào: khi
+                                              // calib trong lúc "Chuyển Bo" thì
+                                              // là mặt của board đích, không
+                                              // phải mặt hiện ở dòng trên.
+                                              Text(
+                                                'Đang calib mặt '
+                                                '${_calibratingSide ?? vrsProvider.currentBoardSide}'
+                                                '${(_calibratingSide ?? vrsProvider.currentBoardSide) == "A" ? " (Top)" : " (Bot)"}'
+                                                '...',
+                                                style: const TextStyle(
+                                                  fontSize: 12,
+                                                ),
+                                              ),
+                                            ],
                                           ),
                                         )
                                       : OutlinedButton.icon(
-                                          onPressed: _triggerManualCalibration,
+                                          // Chặn calib rời trong lúc chuỗi
+                                          // "Chuyển Bo" đang chạy: chuỗi đó tự
+                                          // calib cho board đích.
+                                          onPressed: _advancingBoard
+                                              ? null
+                                              : _triggerManualCalibration,
                                           icon: const Icon(Icons.settings, size: 16),
                                           label: const Text('Calib bù lệch board'),
                                           style: OutlinedButton.styleFrom(
@@ -1611,19 +1814,71 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
 
                                 const SizedBox(height: 24),
 
-                                // Navigation for next board
+                                // Sang LỖI kế tiếp trong cùng board. Nút này
+                                // trước đây bị gắn nhãn "Chuyển Bo" nên không
+                                // ai chuyển được board từ màn thủ công.
                                 SizedBox(
                                   width: double.infinity,
                                   child: ElevatedButton.icon(
                                     onPressed:
                                         _defects.isNotEmpty &&
                                             _currentDefectIndex <
-                                                _defects.length - 1
+                                                _defects.length - 1 &&
+                                            !_isSendingCoords
                                         ? _nextDefect
                                         : null,
                                     icon: const Icon(FeatherIcons.arrowRight),
-                                    label: const Text('Chuyển Bo'),
+                                    label: const Text('Lỗi tiếp theo'),
                                     style: ElevatedButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 12,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+
+                                const SizedBox(height: 8),
+
+                                // Sang BOARD / MẶT kế tiếp
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: ElevatedButton.icon(
+                                    onPressed:
+                                        (_advancingBoard ||
+                                            _calibrating ||
+                                            _isSendingCoords)
+                                        ? null
+                                        : _advanceToNextBoardFromManual,
+                                    icon: _advancingBoard
+                                        ? const SizedBox(
+                                            width: 16,
+                                            height: 16,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              valueColor:
+                                                  AlwaysStoppedAnimation<Color>(
+                                                    Colors.white,
+                                                  ),
+                                            ),
+                                          )
+                                        : const Icon(FeatherIcons.refreshCw),
+                                    label: Text(
+                                      _advancingBoard
+                                          ? 'Đang chuyển bo...'
+                                          : vrsProvider.nextBoardAvailable
+                                          ? 'Chuyển Bo (mặt '
+                                                '${vrsProvider.nextBoardSide})'
+                                          : 'Chuyển Bo',
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor:
+                                          vrsProvider.nextBoardAvailable
+                                          ? Colors.green
+                                          : null,
+                                      foregroundColor:
+                                          vrsProvider.nextBoardAvailable
+                                          ? Colors.white
+                                          : null,
                                       padding: const EdgeInsets.symmetric(
                                         vertical: 12,
                                       ),
@@ -1759,7 +2014,9 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
       final success = await _gerberService.captureGerberImage(
         modelName: model['name'] ?? 'Model_${model['id_model']}',
         coordinates: coordinates,
-        defectType: defect['type'],
+        // Chỉ đi vào metadata hiển thị của QCamberGerberService (payload gửi
+        // QCamber không có field này), nên dùng luôn tên để đọc log dễ hơn.
+        defectType: defectTypeForDisplay(defect),
         layerName: board['layer_id']?.toString() ?? 'l8',
         zoom: 8192.0,
       );
@@ -1789,18 +2046,28 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
   }
 
   void _previousDefect() {
-    if (_defects.isNotEmpty && _currentDefectIndex > 0) {
+    if (_defects.isNotEmpty &&
+        _currentDefectIndex > 0 &&
+        !_isSendingCoords) {
       setState(() => _currentDefectIndex--);
       _loadGerberForCurrentDefect();
       _loadAOIImageForCurrentDefect();
+      // Di chuyển camera đến lỗi mới được chọn - trước đây chỉ đổi ảnh xem
+      // trước mà không di chuyển PLC, khiến camera thực tế vẫn ở lỗi cũ.
+      _moveCameraToDefect();
     }
   }
 
   void _nextDefect() {
-    if (_defects.isNotEmpty && _currentDefectIndex < _defects.length - 1) {
+    if (_defects.isNotEmpty &&
+        _currentDefectIndex < _defects.length - 1 &&
+        !_isSendingCoords) {
       setState(() => _currentDefectIndex++);
       _loadGerberForCurrentDefect();
       _loadAOIImageForCurrentDefect();
+      // Di chuyển camera đến lỗi mới được chọn - trước đây chỉ đổi ảnh xem
+      // trước mà không di chuyển PLC, khiến camera thực tế vẫn ở lỗi cũ.
+      _moveCameraToDefect();
     }
   }
 
@@ -1851,9 +2118,13 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                 boardId: _currentBoardId,
                 defectId: id,
               );
+        // Ghi vào ai_type, KHÔNG ghi đè `type` (loại lỗi gốc AOI báo). Trước
+        // đây ghi 'type': detectedType, mà detectedType rỗng khi AI không phát
+        // hiện gì (_hasAnalysisResult vẫn true nếu detections rỗng) → xoá mất
+        // loại lỗi AOI đúng ở trường hợp phổ biến nhất của soi thủ công.
         final updateFields = <String, dynamic>{
           'time': DateTime.now().toIso8601String(),
-          'type': detectedType,
+          'ai_type': detectedType,
           'judgement': result,
         };
         if (savedAoiPath != null) {
@@ -1912,6 +2183,16 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
           _hasAnalysisResult = false;
         });
         webSocketService.returnToLiveCamera();
+
+        // Board đã phán định hết chưa? Dùng list VỪA reload từ DB (`_defects`
+        // đã được _loadDefectsForBoard cập nhật ở trên), không dùng snapshot cũ.
+        // Trước đây VRS thủ công không bao giờ đánh dấu board hoàn tất, nên
+        // operator chỉ dùng chế độ thủ công sẽ không bao giờ sang được board kế.
+        if (_defects.isNotEmpty && firstUnjudgedDefectIndex(_defects) == -1) {
+          await _completeBoardFromManual();
+          return;
+        }
+
         if (_defects.isNotEmpty && _currentDefectIndex < _defects.length - 1) {
           await Future.delayed(const Duration(milliseconds: 500));
           if (mounted) {
@@ -1920,6 +2201,257 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
         }
       }
     }
+  }
+
+  /// Đã phán định hết lỗi của board hiện tại ở chế độ thủ công -> đánh dấu
+  /// board hoàn tất + tìm board kế, rồi đưa camera về gốc.
+  ///
+  /// Không tự chuyển sang board kế: cần operator lật bo / đặt board mới lên bàn
+  /// trước, nên chỉ nhắc họ bấm "Chuyển Bo".
+  Future<void> _completeBoardFromManual() async {
+    final vrs = Provider.of<VRSProvider>(context, listen: false);
+    final boardId = int.tryParse(_currentBoardId ?? '');
+    await vrs.completeCurrentBoardAndCheckNext();
+
+    // Đưa camera về gốc để operator lật bo / đặt board mới an toàn - giống hệt
+    // đuôi hoàn tất board ở chế độ Auto.
+    try {
+      final moveResult = await _plcGateway.movePlc(
+        x: 0.0,
+        y: 0.0,
+        boardId: boardId,
+      );
+      if (!moveResult.success) {
+        // Không throw khi PLC đang bận / gateway trả lỗi, chỉ báo trong log.
+        debugPrint(
+          'Dua camera ve goc sau khi xong board (thu cong) that bai: '
+          '${moveResult.message}',
+        );
+      }
+    } catch (e) {
+      debugPrint('Loi dua camera ve goc sau khi xong board (thu cong): $e');
+    }
+
+    if (!mounted) return;
+    final hasNext = vrs.nextBoardAvailable;
+    scaffoldMessengerKey.currentState?.showSnackBar(
+      SnackBar(
+        content: Text(
+          hasNext
+              ? 'Đã phán định hết lỗi của board này. Lật bo / đặt board mới lên '
+                    'bàn rồi bấm "Chuyển Bo" để sang board kế tiếp.'
+              : 'Đã phán định hết lỗi của board này. Hiện chưa có board kế tiếp.',
+        ),
+        backgroundColor: Colors.green,
+        duration: const Duration(seconds: 6),
+      ),
+    );
+  }
+
+  /// Bấm "Chuyển Bo" — chuyển sang board (hoặc mặt) kế tiếp ngay tại màn thủ
+  /// công: hoàn tất board hiện tại nếu cần -> calib bù lệch cho board đích ->
+  /// đổi `currentBoard` trên provider.
+  ///
+  /// Trước đây nút "Chuyển Bo" gọi `_nextDefect`, tức chỉ sang LỖI kế tiếp
+  /// trong cùng board (dù comment ngay trên nó ghi "Navigation for next board").
+  /// Màn thủ công do đó KHÔNG có đường nào gọi `advanceToNextBoard()`, nên
+  /// operator buộc phải sang tab Auto VRS bấm "Board tiếp theo" mới đổi được
+  /// board/mặt.
+  Future<void> _advanceToNextBoardFromManual() async {
+    // Guard đồng bộ trước mọi await: calib mất tới 90s, 2 lần bấm nhanh = 2
+    // chuỗi calib song song ghi cùng thanh ghi PLC.
+    if (_advancingBoard || _calibrating || _isSendingCoords) {
+      debugPrint('ManualVRS: bo qua "Chuyen Bo" - dang co thao tac khac');
+      return;
+    }
+    setState(() => _advancingBoard = true);
+    try {
+      final vrs = Provider.of<VRSProvider>(context, listen: false);
+
+      // Chưa có board kế trong provider -> phải hoàn tất board hiện tại trước
+      // (chính `completeCurrentBoardAndCheckNext` mới đi tìm board kế tiếp).
+      if (!vrs.nextBoardAvailable) {
+        final ready = await _finishCurrentBoardBeforeAdvance(vrs);
+        if (!ready || !mounted) return;
+      }
+
+      // Vẫn chưa có -> hỏi lại DB, vì AOI_Ingest (tiến trình riêng) có thể vừa
+      // ghi thêm board mới sau lần check trước.
+      if (!vrs.nextBoardAvailable) {
+        await vrs.checkForNewBoard();
+        if (!mounted) return;
+      }
+      if (!vrs.nextBoardAvailable) {
+        scaffoldMessengerKey.currentState?.showSnackBar(
+          SnackBar(
+            content: Text(
+              vrs.lotFinished
+                  ? 'Đã hết board trong lô này. Chờ AOI xuất board mới.'
+                  : 'Chưa có board kế tiếp trong lô này.',
+            ),
+            backgroundColor: Colors.grey.shade700,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+        return;
+      }
+
+      final targetBoardId = vrs.nextBoardId;
+      final targetSide = vrs.nextBoardSide;
+      final needCalib = vrs.calibrationNeeded;
+
+      final confirmed = await _confirmAdvanceBoardDialog(
+        boardId: targetBoardId,
+        side: targetSide,
+        isNewPhysicalBoard: vrs.nextBoardIsNewPhysical,
+        willCalibrate: needCalib,
+      );
+      if (confirmed != true || !mounted) return;
+
+      // Calib cho board ĐÍCH trước khi đổi (giống hệt `_runCalibrationIfNeeded`
+      // của tab Auto). Calib xong mới `advanceToNextBoard` để lần ghi nhận
+      // calib này không bị hàm đó xoá.
+      if (needCalib) {
+        final ok = await _runCalibration(boardId: targetBoardId, side: targetSide);
+        if (!mounted) return;
+        if (!ok) {
+          // Không âm thầm chuyển board khi calib fail: gateway sẽ dùng toạ độ
+          // chưa bù cho cả board mới.
+          scaffoldMessengerKey.currentState?.showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Chưa chuyển bo vì calib bù lệch thất bại. Kiểm tra gá bo / '
+                'ánh sáng rồi bấm "Chuyển Bo" lại.',
+              ),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 5),
+            ),
+          );
+          return;
+        }
+      }
+
+      await vrs.advanceToNextBoard();
+      if (!mounted) return;
+      // Danh sách lỗi của board mới do listener `_syncBoardFromProvider` tải
+      // (provider vừa notifyListeners) - không tự gọi ở đây để tránh load 2 lần.
+      scaffoldMessengerKey.currentState?.showSnackBar(
+        SnackBar(
+          content: Text(
+            'Đã chuyển sang board $targetBoardId - mặt $targetSide '
+            '${targetSide == "A" ? "(Top)" : "(Bot)"}. '
+            'Bấm "Di chuyển Camera" để tới lỗi đầu tiên.',
+          ),
+          backgroundColor: Colors.green,
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _advancingBoard = false);
+    }
+  }
+
+  /// Hoàn tất board hiện tại để `completeCurrentBoardAndCheckNext` đi tìm được
+  /// board kế. Trả `false` nếu operator hủy.
+  Future<bool> _finishCurrentBoardBeforeAdvance(VRSProvider vrs) async {
+    if (vrs.currentBoard.isEmpty || vrs.currentBoard == 'Chưa có') {
+      return true; // không có board nào đang mở -> để checkForNewBoard xử lý
+    }
+
+    // Đếm lỗi chưa phán định từ DB, không dùng `_defects` trong state: state có
+    // thể cũ nếu board vừa được soi ở tab Auto.
+    final boardId = int.tryParse(vrs.currentBoard);
+    int unjudged = 0;
+    if (boardId != null) {
+      final rows = await _db.getDefectsByBoard(boardId);
+      unjudged = rows.where((d) => !isDefectJudged(d)).length;
+    }
+    if (!mounted) return false;
+
+    if (unjudged > 0) {
+      final choice = await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Board hiện tại chưa kiểm tra hết'),
+          content: Text(
+            'Board ${vrs.currentBoard} còn $unjudged lỗi CHƯA phán định.\n\n'
+            'Chọn "Vẫn chuyển bo" là board này bị đánh dấu ĐÃ XONG ngay (kể cả '
+            'khi bạn hủy ở bước xác nhận sau): nó không còn xuất hiện trong '
+            'danh sách board chờ, $unjudged lỗi trên sẽ vĩnh viễn không có '
+            'phán định.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'stay'),
+              child: const Text('Ở lại kiểm tra tiếp'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, 'force'),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+              child: const Text('Vẫn chuyển bo'),
+            ),
+          ],
+        ),
+      );
+      if (choice != 'force' || !mounted) return false;
+      debugPrint(
+        'ManualVRS: operator chuyen bo khi board ${vrs.currentBoard} '
+        'con $unjudged loi chua phan dinh',
+      );
+    }
+
+    await vrs.completeCurrentBoardAndCheckNext();
+    return mounted;
+  }
+
+  /// Xác nhận trước khi đổi board: operator cần lật bo / đặt board mới lên bàn
+  /// trước, và cần biết sắp mất ~90 giây cho calib.
+  Future<bool?> _confirmAdvanceBoardDialog({
+    required String boardId,
+    required String side,
+    required bool isNewPhysicalBoard,
+    required bool willCalibrate,
+  }) {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Chuyển sang board kế tiếp'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              isNewPhysicalBoard
+                  ? 'Board vật lý MỚI - hãy lấy bo cũ ra và đặt bo mới lên bàn.'
+                  : 'Cùng bo, đổi mặt - hãy LẬT bo lại.',
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 12),
+            Text('Board đích: $boardId'),
+            Text('Mặt: $side ${side == "A" ? "(Top)" : "(Bot)"}'),
+            const SizedBox(height: 12),
+            Text(
+              willCalibrate
+                  ? '⚙️ Sẽ tự động calib bù lệch cho board này (khoảng 90 giây).'
+                  : 'Không cần calib lại cho lần chuyển này.',
+              style: const TextStyle(fontSize: 13, color: Colors.orange),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Hủy'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Đã đặt bo - Chuyển'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Build widget hiển thị kết quả defect detection

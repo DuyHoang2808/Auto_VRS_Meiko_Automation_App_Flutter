@@ -144,7 +144,7 @@ class _DefectListWidgetState extends State<DefectListWidget> {
             separatorBuilder: (_, __) => const Divider(height: 1),
             itemBuilder: (context, index) {
               final d = defects[index];
-              final type = (d['type'] ?? '').toString();
+              final type = defectTypeForDisplay(d) ?? '';
               final judgement = (d['judgement'] ?? 'Chua xac dinh').toString();
               final time = (d['time'] ?? '').toString();
               final coords = (d['coordinates'] ?? '').toString();
