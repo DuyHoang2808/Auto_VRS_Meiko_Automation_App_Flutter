@@ -179,12 +179,51 @@ class VRSProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Áp dụng 1 lot đã xác định (hoặc `null` = model chưa có lot khả dụng)
-  /// vào state hiện tại: currentLot/currentLotCode + board đầu tiên còn dở
-  /// của lot đó. Dùng chung bởi mọi đường "vào" 1 lot - tự động chọn
-  /// (setCurrentModel/khởi động app) hay vận hành viên tự chọn thủ công
-  /// (setCurrentModelAndLot) - để logic áp dụng lot luôn nhất quán.
-  Future<void> _applyLot(Map<String, dynamic>? lot) async {
+  Future<void> setCurrentModel(String modelId) async {
+    try {
+      final model = await _db.getModelById(int.parse(modelId));
+
+      if (model != null) {
+        // Đổi model -> đổi board, offset đã calib không còn đúng.
+        invalidateCalibration();
+        _currentModel = model['id_model'].toString();
+        _currentModelName = 'Model ${model['id_model']}';
+
+        // Lấy lô "đang chạy" liên kết với model (lot cũ nhất còn dở, hoặc
+        // lot mới nhất nếu mọi lot đã hoàn tất - xem getCurrentLotForModel)
+        final lot = await _db.getCurrentLotForModel(modelId);
+        if (lot != null) {
+          _currentLot = lot['id_lot'].toString();
+          _currentLotCode = lot['lot_code']?.toString() ?? _currentLot;
+
+          // Lấy bo đầu tiên liên kết với lô
+          final board = await _db.getFirstBoardByLotId(_currentLot);
+          _currentBoard = board != null
+              ? board['id_board'].toString()
+              : 'Chưa có';
+          _currentBoardCode = board?['board_code']?.toString() ?? '';
+          _currentBoardSide = boardSideFromLayerId(
+            board?['layer_id']?.toString(),
+          );
+        } else {
+          _currentLot = 'Chưa có';
+          _currentLotCode = '';
+          _currentBoard = 'Chưa có';
+          _currentBoardCode = '';
+          _currentBoardSide = 'A';
+        }
+
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('Error setting current model: $e');
+    }
+  }
+
+  Future<void> _resolveFirstLotAndBoardForModel(String modelId) async {
+    // Chuyển sang board đầu tiên của model -> offset calib cũ không còn đúng.
+    invalidateCalibration();
+    final lot = await _db.getCurrentLotForModel(modelId);
     if (lot == null) {
       _currentLot = 'Chưa có';
       _currentLotCode = '';
@@ -201,49 +240,6 @@ class VRSProvider extends ChangeNotifier {
     _currentBoard = board != null ? board['id_board'].toString() : 'Chưa có';
     _currentBoardCode = board?['board_code']?.toString() ?? '';
     _currentBoardSide = boardSideFromLayerId(board?['layer_id']?.toString());
-  }
-
-  /// Chọn model, TỰ ĐỘNG chọn lot theo getCurrentLotForModel (lot cũ nhất
-  /// còn dở, hoặc mới nhất nếu mọi lot đã xong). Dùng khi không có màn hình
-  /// chọn lot thủ công ở giữa (vd khôi phục trạng thái lúc khởi động app -
-  /// xem _resolveFirstLotAndBoardForModel).
-  Future<void> setCurrentModel(String modelId) async {
-    try {
-      final model = await _db.getModelById(int.parse(modelId));
-      if (model != null) {
-        // Đổi model -> đổi board, offset đã calib không còn đúng.
-        invalidateCalibration();
-        _currentModel = model['id_model'].toString();
-        _currentModelName = 'Model ${model['id_model']}';
-        await _applyLot(await _db.getCurrentLotForModel(modelId));
-        notifyListeners();
-      }
-    } catch (e) {
-      debugPrint('Error setting current model: $e');
-    }
-  }
-
-  /// Chọn model VÀ lot cụ thể (vận hành viên tự chọn ở màn hình chọn lot,
-  /// xem SelectLotForModelScreen) - không tự đoán lot như setCurrentModel.
-  Future<void> setCurrentModelAndLot(String modelId, int idLot) async {
-    try {
-      final model = await _db.getModelById(int.parse(modelId));
-      if (model != null) {
-        invalidateCalibration();
-        _currentModel = model['id_model'].toString();
-        _currentModelName = 'Model ${model['id_model']}';
-        await _applyLot(await _db.getLotById(idLot));
-        notifyListeners();
-      }
-    } catch (e) {
-      debugPrint('Error setting current model and lot: $e');
-    }
-  }
-
-  Future<void> _resolveFirstLotAndBoardForModel(String modelId) async {
-    // Chuyển sang board đầu tiên của model -> offset calib cũ không còn đúng.
-    invalidateCalibration();
-    await _applyLot(await _db.getCurrentLotForModel(modelId));
   }
 
   /// Gọi khi workflow tự động đã chạy hết toàn bộ lỗi của board hiện tại.

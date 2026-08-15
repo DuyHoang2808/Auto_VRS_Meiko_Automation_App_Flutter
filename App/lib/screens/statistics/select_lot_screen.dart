@@ -93,7 +93,29 @@ class _SelectLotScreenState extends State<SelectLotScreen> {
                         ),
                       ],
                     ),
-                    const SizedBox(height: 24),
+                    const SizedBox(height: 16),
+                    // Xem tổng tất cả các lô - không truyền ?lot
+                    Card(
+                      elevation: 2,
+                      color: Colors.blue.shade50,
+                      child: ListTile(
+                        leading: const Icon(Icons.select_all),
+                        title: const Text(
+                          'Tất cả các lô',
+                          style: TextStyle(fontWeight: FontWeight.w500),
+                        ),
+                        subtitle: const Text(
+                          'Gộp toàn bộ lỗi của mọi lô, mọi model',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                        trailing: const Icon(Icons.arrow_forward_ios),
+                        onTap: () => context.push('/defect-type'),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
                     Flexible(
                       child: ListView.separated(
                         shrinkWrap: true,
@@ -116,7 +138,11 @@ class _SelectLotScreenState extends State<SelectLotScreen> {
                                 ),
                               ),
                               trailing: const Icon(Icons.arrow_forward_ios),
-                              onTap: () => context.push('/defect-type'),
+                              // Phải truyền id_lot, nếu không màn thống kê hiện
+                              // số tổng của toàn bộ DB bất kể chọn lô nào.
+                              onTap: () => context.push(
+                                '/defect-type?lot=${lot['id_lot']}',
+                              ),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(8),
                               ),

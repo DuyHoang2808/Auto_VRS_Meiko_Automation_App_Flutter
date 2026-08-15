@@ -1063,28 +1063,20 @@ class LocalDatabaseService {
   /// get_or_create_lot), 1 model có thể tích luỹ nhiều lot theo thời gian,
   /// và "cũ nhất" sẽ mãi đứng ở lot đầu tiên chứ không theo lot đang chạy
   /// thật - đây là hàm thay thế đúng ngữ nghĩa hơn.
-  // Lot "chưa xong": chưa có board nào, hoặc còn ít nhất 1 board chưa
-  // 'completed'. Dùng chung bởi getCurrentLotForModel (tự động chọn 1 lot)
-  // và getSelectableLotsForModel (liệt kê cho vận hành viên tự chọn) - cùng
-  // một định nghĩa "còn việc để làm" ở cấp lot.
-  static const String _unfinishedLotWhere = '''
-    (
-      NOT EXISTS (SELECT 1 FROM tbBoard b WHERE b.tbLotid_lot = l.id_lot)
-      OR EXISTS (
-        SELECT 1 FROM tbBoard b
-        WHERE b.tbLotid_lot = l.id_lot
-          AND (b.status IS NULL OR b.status != 'completed')
-      )
-    )
-  ''';
-
   Future<Map<String, dynamic>?> getCurrentLotForModel(String idModel) async {
     final db = await database;
     final unfinished = await db.rawQuery(
       '''
       SELECT l.* FROM tbLot l
       WHERE l.tbModelid_model = ?
-        AND $_unfinishedLotWhere
+        AND (
+          NOT EXISTS (SELECT 1 FROM tbBoard b WHERE b.tbLotid_lot = l.id_lot)
+          OR EXISTS (
+            SELECT 1 FROM tbBoard b
+            WHERE b.tbLotid_lot = l.id_lot
+              AND (b.status IS NULL OR b.status != 'completed')
+          )
+        )
       ORDER BY l.id_lot ASC
       LIMIT 1
       ''',
@@ -1100,34 +1092,6 @@ class LocalDatabaseService {
       limit: 1,
     );
     return all.isNotEmpty ? all.first : null;
-  }
-
-  /// Liệt kê mọi lot CHƯA xong của 1 model (xem _unfinishedLotWhere), để vận
-  /// hành viên tự chọn lot muốn xử lý sau khi chọn model - thay vì app tự
-  /// đoán như getCurrentLotForModel. Lot đã xử lý hết board (mọi board
-  /// 'completed') sẽ KHÔNG xuất hiện trong danh sách này.
-  ///
-  /// Kèm `actual_boards`/`pending_boards` (đếm thật từ tbBoard) thay vì
-  /// dùng `tbLot.board_quantity` - cột đó AOI_Ingest không hề ghi vào nên
-  /// luôn NULL, không phản ánh số bo thật đã nhận cho lot.
-  Future<List<Map<String, dynamic>>> getSelectableLotsForModel(
-    String idModel,
-  ) async {
-    final db = await database;
-    return await db.rawQuery(
-      '''
-      SELECT l.*,
-        COUNT(b.id_board) as actual_boards,
-        SUM(CASE WHEN b.status IS NULL OR b.status != 'completed' THEN 1 ELSE 0 END) as pending_boards
-      FROM tbLot l
-      LEFT JOIN tbBoard b ON b.tbLotid_lot = l.id_lot
-      WHERE l.tbModelid_model = ?
-        AND $_unfinishedLotWhere
-      GROUP BY l.id_lot
-      ORDER BY l.id_lot ASC
-      ''',
-      [idModel],
-    );
   }
 
   /// Lấy board "bắt đầu/tiếp tục" cho 1 lot: board có id_board nhỏ nhất

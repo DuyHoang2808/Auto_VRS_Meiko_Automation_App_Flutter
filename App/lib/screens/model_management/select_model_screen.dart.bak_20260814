@@ -312,24 +312,17 @@ class _SelectModelScreenState extends State<SelectModelScreen> {
     if (confirmed != true || !mounted) return;
 
     try {
+      // Cập nhật model trong Provider
+      final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
+
       // Capture router before async gaps to avoid using context after await
       final router = GoRouter.of(context);
-      final modelId = model['id_model'].toString();
 
-      // Sau khi xác nhận model, chuyển tiếp sang màn chọn lot cụ thể (chỉ
-      // liệt kê lot chưa xử lý hết bo) - thay vì để app tự đoán lot như
-      // trước đây. Màn đó trả về id_lot đã chọn qua context.pop(idLot);
-      // null nếu vận hành viên bấm back mà không chọn gì.
-      final idLot = await router.push<int>('/select-lot-for-model/$modelId');
-      if (idLot == null || !mounted) return;
-
-      // Cập nhật model + lot trong Provider
-      final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
-      await vrsProvider.setCurrentModelAndLot(modelId, idLot);
+      await vrsProvider.setCurrentModel(model['id_model'].toString());
 
       // Update selected model ID for UI highlighting
       setState(() {
-        _selectedModelId = modelId;
+        _selectedModelId = model['id_model'].toString();
       });
 
       // ✅ Bỏ snackbar vì đã có thông báo model đang chọn ở UI

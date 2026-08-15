@@ -1402,9 +1402,9 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
 
         // compute display values
         final lotText =
-            (vrsProvider.currentLot.isNotEmpty &&
-                vrsProvider.currentLot != 'Chưa có')
-            ? vrsProvider.currentLot
+            (vrsProvider.currentLotCode.isNotEmpty &&
+                vrsProvider.currentLotCode != 'Chưa có')
+            ? vrsProvider.currentLotCode
             : 'Chưa có';
         final boardText =
             (vrsProvider.currentBoard.isNotEmpty &&
@@ -1762,7 +1762,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
                           const Divider(height: 24),
 
                           // Info rows (dynamic from providers)
-                          _buildInfoRow('Mã Lô (id_lot):', lotText),
+                          _buildInfoRow('Mã Lô:', lotText),
                           const SizedBox(height: 12),
                           _buildInfoRow('Số thứ tự bo:', boardText),
                           const SizedBox(height: 12),

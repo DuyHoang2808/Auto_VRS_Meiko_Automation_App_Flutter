@@ -2,9 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:provider/provider.dart';
 import '../../providers/statistics_provider.dart';
+import '../../services/local_database_service.dart' show kUnjudgedDefectKey;
 
 class DefectTypeScreen extends StatefulWidget {
-  const DefectTypeScreen({super.key});
+  /// Lô cần thống kê. `null` = tất cả các lô.
+  final int? lotId;
+
+  const DefectTypeScreen({super.key, this.lotId});
 
   @override
   State<DefectTypeScreen> createState() => _DefectTypeScreenState();
@@ -14,13 +18,52 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
   @override
   void initState() {
     super.initState();
-    // Ensure data is loaded
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
       final provider = Provider.of<StatisticsProvider>(context, listen: false);
-      if (!provider.isLoading && provider.defectData.isEmpty) {
-        provider.initialize();
-      }
+      // Cần danh sách lô cho bộ chọn phạm vi bên dưới.
+      if (provider.lots.isEmpty) await provider.initialize();
+      if (!mounted) return;
+      await provider.selectDefectStatsLot(widget.lotId);
     });
+  }
+
+  /// Tên loại lỗi để hiện cho người vận hành.
+  String _displayName(String key) {
+    if (key == kUnjudgedDefectKey) return 'Chưa soi';
+    switch (key.toLowerCase()) {
+      case 'bamdinhkhongtot':
+        return 'Bám Dính Không Tốt';
+      case 'chamkim':
+        return 'Chạm Kim';
+      case 'divat':
+        return 'Dị Vật';
+      case 'divatduongmach':
+        return 'Dị Vật Đường Mạch';
+      case 'khuyetmach':
+        return 'Khuyết Mạch';
+      case 'nganmach':
+        return 'Ngắn Mạch';
+      case 'thieudong':
+        return 'Thiếu Đồng';
+      case 'thieudongduongmach':
+        return 'Thiếu Đồng Đường Mạch';
+      case 'thuadong':
+        return 'Thừa Đồng';
+      case 'thuadongduongmach':
+        return 'Thừa Đồng Đường Mạch';
+      case 'vetlom':
+        return 'Vết Lõm';
+      case 'xuoc':
+        return 'Xước';
+      case 'other':
+        return 'Khác';
+      // AI không phát hiện gì nhưng người vận hành đã phán định (thường là OK).
+      case 'none':
+        return 'Không phát hiện lỗi';
+      default:
+        return key;
+    }
   }
 
   @override
@@ -75,6 +118,60 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
     );
   }
 
+  /// Nói rõ số liệu đang thuộc phạm vi nào - trước đây màn này luôn hiện tổng
+  /// toàn bộ DB nhưng không ghi ở đâu, nên dễ tưởng là số của lô vừa chọn.
+  String _scopeSubtitle(StatisticsProvider statsProvider) {
+    final lotId = statsProvider.selectedLotId;
+    final unjudged = statsProvider.defectData[kUnjudgedDefectKey] ?? 0;
+    final scope = lotId == null
+        ? 'Phạm vi: tất cả các lô'
+        : 'Phạm vi: lô ${_lotLabel(statsProvider, lotId)}';
+    if (unjudged == 0) return '$scope · đã soi hết';
+    return '$scope · còn $unjudged lỗi chưa soi (chưa có loại lỗi)';
+  }
+
+  /// Mã lot hiển thị cho 1 id_lot - tái dùng `statsProvider.lots` (đã có
+  /// lot_code thật, xem StatisticsProvider.loadLots) thay vì tự dựng
+  /// `"LOT-<id_lot>"` từ khóa nội bộ như trước đây.
+  String _lotLabel(StatisticsProvider statsProvider, int lotId) {
+    for (final lot in statsProvider.lots) {
+      final id = lot['id_lot'] is int
+          ? lot['id_lot'] as int
+          : int.tryParse('${lot['id_lot']}');
+      if (id == lotId) return (lot['lot_id'] as String?) ?? 'LOT-$lotId';
+    }
+    return 'LOT-$lotId';
+  }
+
+  Widget _buildLotSelector(StatisticsProvider statsProvider) {
+    final items = <DropdownMenuItem<int?>>[
+      const DropdownMenuItem<int?>(value: null, child: Text('Tất cả các lô')),
+      ...statsProvider.lots.map((lot) {
+        final id = lot['id_lot'] is int
+            ? lot['id_lot'] as int
+            : int.tryParse('${lot['id_lot']}');
+        return DropdownMenuItem<int?>(
+          value: id,
+          child: Text('${lot['lot_id'] ?? 'LOT-$id'}'),
+        );
+      }),
+    ];
+
+    // Lô đang chọn có thể không nằm trong danh sách (vd đã bị xoá) -> để null
+    // thay vì ném lỗi "no item with value".
+    final current = items.any((i) => i.value == statsProvider.selectedLotId)
+        ? statsProvider.selectedLotId
+        : null;
+
+    return DropdownButton<int?>(
+      value: current,
+      items: items,
+      onChanged: statsProvider.isLoading
+          ? null
+          : (value) => statsProvider.selectDefectStatsLot(value),
+    );
+  }
+
   Widget _buildDefectContent(StatisticsProvider statsProvider) {
     final defectEntries = statsProvider.defectData.entries.toList();
     
@@ -84,9 +181,33 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Thống kê loại lỗi - Tổng: ${statsProvider.totalDefects} lỗi',
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Thống kê loại lỗi - Tổng: ${statsProvider.totalDefects} lỗi',
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _scopeSubtitle(statsProvider),
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.grey.shade600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                _buildLotSelector(statsProvider),
+              ],
             ),
             const SizedBox(height: 24),
             Expanded(
@@ -196,7 +317,7 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
                                               const SizedBox(width: 8),
                                               Expanded(
                                                 child: Text(
-                                                  entry.key,
+                                                  _displayName(entry.key),
                                                   style: const TextStyle(fontSize: 12),
                                                 ),
                                               ),
@@ -327,7 +448,7 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
                                                   ),
                                                   const SizedBox(width: 8),
                                                   Text(
-                                                    entry.key,
+                                                    _displayName(entry.key),
                                                     style: const TextStyle(fontSize: 14),
                                                   ),
                                                 ],
@@ -381,6 +502,9 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
   // `_getDefectDisplayName` trong vrs_main_screen.dart) - KHÔNG phải tên
   // hiển thị tiếng Việt, nếu không mọi loại lỗi đều rơi vào default (xám).
   Color _getDefectColor(String defectType) {
+    // Nhóm "chưa soi" không phải một loại lỗi - tô khác hẳn để không bị đọc
+    // nhầm thành một loại lỗi thật trên biểu đồ.
+    if (defectType == kUnjudgedDefectKey) return Colors.blueGrey.shade200;
     switch (defectType.toLowerCase()) {
       case 'bamdinhkhongtot':
         return Colors.brown;

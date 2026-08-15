@@ -251,24 +251,6 @@ class LocalDatabaseService {
         }
       }
 
-      // Kiểm tra tbLot có cột lot_code chưa - mã lot thật AOI đặt tên cho
-      // folder lot (watch_dir/<lot_code>/<board_id>/...), thay cho việc chỉ
-      // định danh lot bằng id_lot nội bộ. Migration này đồng bộ với
-      // AOI_Ingest/aoi_ingest_service.py::ensure_schema, vốn đã thêm cột này
-      // ở phía Python và dùng nó làm khoá get_or_create_lot(model, lot_code).
-      // Lot tạo trước migration này sẽ có lot_code = NULL mãi mãi - nơi hiển
-      // thị cần fallback cho trường hợp đó.
-      final hasLotCode = lotInfo.any((col) => col['name'] == 'lot_code');
-      if (!hasLotCode) {
-        debugPrint('⚠️ Migration: Adding lot_code column to tbLot');
-        try {
-          await db.execute('ALTER TABLE tbLot ADD COLUMN lot_code TEXT');
-          debugPrint('✅ Migration completed: lot_code column added');
-        } catch (e) {
-          debugPrint('⚠️ Could not add lot_code to tbLot: $e');
-        }
-      }
-
       // Kiểm tra tbBoard có cột tbLotid_lot chưa
       final boardInfo = await db.rawQuery("PRAGMA table_info(tbBoard)");
       final hasTbLotIdLot = boardInfo.any(
@@ -975,9 +957,8 @@ class LocalDatabaseService {
   Future<List<Map<String, dynamic>>> getAllLotStatistics() async {
     final db = await database;
     return await db.rawQuery('''
-      SELECT
+      SELECT 
         l.id_lot,
-        l.lot_code,
         l.board_quantity,
         l.NG_rate,
         l.fakeDef,
@@ -1049,85 +1030,15 @@ class LocalDatabaseService {
     }
   }
 
-  /// Lấy lot "đang chạy" cho 1 model: lot cũ nhất (id_lot ASC) mà vẫn còn
-  /// board chưa hoàn tất, hoặc chưa có board nào cả - cùng nguyên tắc với
-  /// "board tiếp theo" (xem getFirstBoardByLotId) nhưng áp dụng ở cấp lot.
-  /// Nếu MỌI lot của model đã hoàn tất hết, trả về lot MỚI NHẤT (id_lot DESC)
-  /// để màn hình vẫn hiện được thông tin gì đó, thay vì "Chưa có" dù model
-  /// đã có dữ liệu.
-  ///
-  /// Trước đây (`getFirstLotByModelId`, đã xoá) chỉ lấy lot cũ nhất vô điều
-  /// kiện - đúng khi 1 model chỉ có duy nhất 1 lot (quy ước cũ của
-  /// AOI_Ingest: tái sử dụng mãi 1 lot rỗng). Từ khi AOI_Ingest tạo 1 lot
-  /// MỚI cho mỗi lot_code AOI ghi ra (xem AOI_Ingest/aoi_ingest_service.py::
-  /// get_or_create_lot), 1 model có thể tích luỹ nhiều lot theo thời gian,
-  /// và "cũ nhất" sẽ mãi đứng ở lot đầu tiên chứ không theo lot đang chạy
-  /// thật - đây là hàm thay thế đúng ngữ nghĩa hơn.
-  // Lot "chưa xong": chưa có board nào, hoặc còn ít nhất 1 board chưa
-  // 'completed'. Dùng chung bởi getCurrentLotForModel (tự động chọn 1 lot)
-  // và getSelectableLotsForModel (liệt kê cho vận hành viên tự chọn) - cùng
-  // một định nghĩa "còn việc để làm" ở cấp lot.
-  static const String _unfinishedLotWhere = '''
-    (
-      NOT EXISTS (SELECT 1 FROM tbBoard b WHERE b.tbLotid_lot = l.id_lot)
-      OR EXISTS (
-        SELECT 1 FROM tbBoard b
-        WHERE b.tbLotid_lot = l.id_lot
-          AND (b.status IS NULL OR b.status != 'completed')
-      )
-    )
-  ''';
-
-  Future<Map<String, dynamic>?> getCurrentLotForModel(String idModel) async {
+  Future<Map<String, dynamic>?> getFirstLotByModelId(String idModel) async {
     final db = await database;
-    final unfinished = await db.rawQuery(
-      '''
-      SELECT l.* FROM tbLot l
-      WHERE l.tbModelid_model = ?
-        AND $_unfinishedLotWhere
-      ORDER BY l.id_lot ASC
-      LIMIT 1
-      ''',
-      [idModel],
-    );
-    if (unfinished.isNotEmpty) return unfinished.first;
-
-    final all = await db.query(
+    final lots = await db.query(
       'tbLot',
       where: 'tbModelid_model = ?',
       whereArgs: [idModel],
-      orderBy: 'id_lot DESC',
-      limit: 1,
+      orderBy: 'id_lot ASC',
     );
-    return all.isNotEmpty ? all.first : null;
-  }
-
-  /// Liệt kê mọi lot CHƯA xong của 1 model (xem _unfinishedLotWhere), để vận
-  /// hành viên tự chọn lot muốn xử lý sau khi chọn model - thay vì app tự
-  /// đoán như getCurrentLotForModel. Lot đã xử lý hết board (mọi board
-  /// 'completed') sẽ KHÔNG xuất hiện trong danh sách này.
-  ///
-  /// Kèm `actual_boards`/`pending_boards` (đếm thật từ tbBoard) thay vì
-  /// dùng `tbLot.board_quantity` - cột đó AOI_Ingest không hề ghi vào nên
-  /// luôn NULL, không phản ánh số bo thật đã nhận cho lot.
-  Future<List<Map<String, dynamic>>> getSelectableLotsForModel(
-    String idModel,
-  ) async {
-    final db = await database;
-    return await db.rawQuery(
-      '''
-      SELECT l.*,
-        COUNT(b.id_board) as actual_boards,
-        SUM(CASE WHEN b.status IS NULL OR b.status != 'completed' THEN 1 ELSE 0 END) as pending_boards
-      FROM tbLot l
-      LEFT JOIN tbBoard b ON b.tbLotid_lot = l.id_lot
-      WHERE l.tbModelid_model = ?
-        AND $_unfinishedLotWhere
-      GROUP BY l.id_lot
-      ORDER BY l.id_lot ASC
-      ''',
-      [idModel],
-    );
+    return lots.isNotEmpty ? lots.first : null;
   }
 
   /// Lấy board "bắt đầu/tiếp tục" cho 1 lot: board có id_board nhỏ nhất

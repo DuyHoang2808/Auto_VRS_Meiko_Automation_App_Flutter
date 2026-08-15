@@ -37,6 +37,7 @@ class NavigationProvider extends ChangeNotifier {
       'home': 'Trang chủ',
       'select_model': 'Cài đặt Model',
       'add_model': 'Cài đặt > Thêm mã hàng mới',
+      'select_lot_for_model': 'Cài đặt > Chọn lô',
       'vrs_main': 'Giám sát Auto VRS',
       'statistics': 'Thống kê',
       'ng_rate': 'Thống kê > Tỉ lệ phán định',

@@ -2,7 +2,6 @@ import 'package:go_router/go_router.dart';
 import '../screens/main_layout.dart';
 import '../screens/home_screen.dart';
 import '../screens/model_management/select_model_screen.dart';
-import '../screens/model_management/select_lot_for_model_screen.dart';
 import '../screens/model_management/add_model_screen.dart';
 import '../screens/vrs/vrs_main_screen.dart';
 import '../screens/vrs/manual_vrs_screen.dart';
@@ -33,18 +32,6 @@ class AppRoutes {
         path: '/add-model',
         name: 'add_model',
         builder: (context, state) => const MainLayout(child: AddModelScreen()),
-      ),
-      GoRoute(
-        // Đẩy sang từ SelectModelScreen sau khi xác nhận model - vận hành
-        // viên chọn tiếp 1 lot cụ thể (chỉ liệt kê lot chưa xử lý hết bo).
-        // Trả về id_lot qua context.pop(idLot) - xem SelectLotForModelScreen.
-        path: '/select-lot-for-model/:modelId',
-        name: 'select_lot_for_model',
-        builder: (context, state) => MainLayout(
-          child: SelectLotForModelScreen(
-            modelId: state.pathParameters['modelId']!,
-          ),
-        ),
       ),
       GoRoute(
         path: '/vrs-main',

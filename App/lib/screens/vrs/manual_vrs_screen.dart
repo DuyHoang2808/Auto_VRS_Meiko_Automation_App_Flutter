@@ -1345,9 +1345,9 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
                                 const Divider(height: 24),
                                 // Info rows
                                 _buildInfoRow(
-                                  'Mã Lỗi:',
-                                  vrsProvider.currentLot.isNotEmpty
-                                      ? vrsProvider.currentLot
+                                  'Mã Lô:',
+                                  vrsProvider.currentLotCode.isNotEmpty
+                                      ? vrsProvider.currentLotCode
                                       : 'Chưa có',
                                 ),
                                 const SizedBox(height: 12),

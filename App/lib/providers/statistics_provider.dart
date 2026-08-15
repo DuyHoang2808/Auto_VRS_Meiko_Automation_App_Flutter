@@ -7,19 +7,17 @@ class StatisticsProvider extends ChangeNotifier {
   // Cached data
   Map<String, int> _defectData = {};
   List<Map<String, dynamic>> _lotStatistics = [];
-  List<Map<String, dynamic>> _defectStatistics = [];
   List<Map<String, dynamic>> _lots = [];
-  String _selectedLot = '';
+  // Phạm vi của `_defectData`: null = tất cả các lô.
+  int? _selectedLotId;
   bool _isLoading = false;
 
   // Getters
   Map<String, int> get defectData => Map.unmodifiable(_defectData);
   List<Map<String, dynamic>> get lotStatistics =>
       List.unmodifiable(_lotStatistics);
-  List<Map<String, dynamic>> get defectStatistics =>
-      List.unmodifiable(_defectStatistics);
   List<Map<String, dynamic>> get lots => List.unmodifiable(_lots);
-  String get selectedLot => _selectedLot;
+  int? get selectedLotId => _selectedLotId;
   bool get isLoading => _isLoading;
 
   int get totalDefects =>
@@ -42,10 +40,10 @@ class StatisticsProvider extends ChangeNotifier {
     }
   }
 
-  // Load defect statistics from database
+  // Load defect statistics from database (theo phạm vi `_selectedLotId`)
   Future<void> loadDefectStatistics() async {
     try {
-      _defectData = await _db.getDefectStatistics();
+      _defectData = await _db.getDefectStatistics(idLot: _selectedLotId);
       notifyListeners();
     } catch (e) {
       debugPrint('Error loading defect statistics: $e');
@@ -57,9 +55,12 @@ class StatisticsProvider extends ChangeNotifier {
     try {
       final rawStats = await _db.getAllLotStatistics();
       _lotStatistics = rawStats.map((stat) {
+        // lot_code = null cho lot tạo trước migration tbLot.lot_code -
+        // fallback về kiểu nhãn cũ tự sinh từ id_lot cho các lot đó.
+        final lotLabel = stat['lot_code']?.toString() ?? 'LOT-${stat['id_lot']}';
         return {
-          'lotId': 'LOT-${stat['id_lot']}',
-          'lotName': 'Lot ${stat['id_lot']}',
+          'lotId': lotLabel,
+          'lotName': lotLabel,
           'boardCount': stat['actual_boards'] ?? 0,
           'ngRate':
               ((stat['ng_boards'] ?? 0) / (stat['actual_boards'] ?? 1)) * 100,
@@ -133,47 +134,22 @@ class StatisticsProvider extends ChangeNotifier {
     }
   }
 
-  // Select lot for detailed view
-  void selectLot(String lotId) {
-    _selectedLot = lotId;
+  /// Đổi phạm vi thống kê loại lỗi rồi nạp lại. [lotId] `null` = tất cả các lô.
+  ///
+  /// Thay cho `selectLot()` + `loadLotDefectStatistics()` cũ: cả hai đều không
+  /// nơi nào gọi (`selectLot` chỉ ghi vào 1 biến không ai đọc), và
+  /// `loadLotDefectStatistics` còn gom theo cột `type` - tức mã SỐ thô của AOI.
+  /// Nay chỉ còn một đường duy nhất, gom theo `ai_type` ở tầng SQL.
+  Future<void> selectDefectStatsLot(int? lotId) async {
+    if (_selectedLotId == lotId && _defectData.isNotEmpty) return;
+    _selectedLotId = lotId;
+    _isLoading = true;
     notifyListeners();
-  }
-
-  // Load detailed defect statistics for a specific lot
-  Future<void> loadLotDefectStatistics(int lotId) async {
     try {
-      final boards = await _db.getBoardsByLot(lotId);
-      final allDefects = <Map<String, dynamic>>[];
-
-      for (final board in boards) {
-        final defects = await _db.getDefectsByBoard(board['id_board']);
-        allDefects.addAll(defects);
-      }
-
-      // Group defects by type and calculate statistics
-      final defectTypes = <String, Map<String, int>>{};
-      for (final defect in allDefects) {
-        final type = defect['type'] ?? 'Unknown';
-        if (!defectTypes.containsKey(type)) {
-          defectTypes[type] = {'count': 0, 'total': 0};
-        }
-        defectTypes[type]!['count'] = defectTypes[type]!['count']! + 1;
-        defectTypes[type]!['total'] = defectTypes[type]!['total']! + 1;
-      }
-
-      _defectStatistics = defectTypes.entries.map((entry) {
-        return {
-          'type': entry.key,
-          'count': entry.value['count'],
-          'percentage': allDefects.isNotEmpty
-              ? (entry.value['count']! / allDefects.length * 100).toDouble()
-              : 0.0,
-        };
-      }).toList();
-
+      await loadDefectStatistics();
+    } finally {
+      _isLoading = false;
       notifyListeners();
-    } catch (e) {
-      debugPrint('Error loading defect statistics: $e');
     }
   }
 
