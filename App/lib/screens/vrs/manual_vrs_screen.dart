@@ -2027,6 +2027,32 @@ class _ManualVRSScreenState extends State<ManualVRSScreen> {
         );
       } else {
         debugPrint('❌ Failed to load Gerber: ${_gerberService.lastError}');
+        // QCamber đang mở nhầm file thiết kế mạch (job) so với mã hàng đang
+        // chạy - cảnh báo rõ vì ảnh Gerber tham chiếu đang hiển thị là của
+        // board KHÁC, operator có thể đối chiếu lỗi nhầm sang thiết kế đó.
+        if (_gerberService.wrongJobOpen && mounted) {
+          await showDialog<void>(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) => AlertDialog(
+              icon: const Icon(Icons.error, color: Colors.red, size: 48),
+              title: const Text('Mở nhầm file thiết kế mạch'),
+              content: Text(
+                'QCamber đang mở file "${_gerberService.openJobName}" nhưng '
+                'mã hàng đang chạy cần file '
+                '"${_gerberService.requestedJobNameOnError}".\n\n'
+                'Ảnh thiết kế đang hiển thị KHÔNG đáng tin. Vui lòng mở đúng '
+                'file thiết kế mạch trong QCamber rồi tải lại.',
+              ),
+              actions: [
+                ElevatedButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Đã hiểu'),
+                ),
+              ],
+            ),
+          );
+        }
       }
     } catch (e) {
       debugPrint('Error loading Gerber: $e');

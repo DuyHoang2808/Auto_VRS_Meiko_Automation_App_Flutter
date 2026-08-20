@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:autovrs_app/core/feather_icons.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import '../../providers/vrs_provider.dart';
 import '../../services/local_database_service.dart';
+import '../../services/plc_gateway_service.dart';
+import '../../services/qcamber_gerber_service.dart';
 import '../../main.dart';
 
 class SelectModelScreen extends StatefulWidget {
@@ -326,6 +329,59 @@ class _SelectModelScreenState extends State<SelectModelScreen> {
       // Cập nhật model + lot trong Provider
       final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
       await vrsProvider.setCurrentModelAndLot(modelId, idLot);
+
+      // Báo cho PLC Gateway đổi sang đúng mã hàng (weights YOLO + file calib
+      // tương ứng) - product_code lấy từ cột `name`, KHÔNG PHẢI id_model (xem
+      // update/BAO_CAO_KIEM_TRA_TICH_HOP_PRODUCT_CODE_GATEWAY.md).
+      final productCode = model['name']?.toString();
+      if (productCode != null && productCode.isNotEmpty) {
+        final selectResult = await PlcGatewayService().selectProduct(
+          productCode,
+        );
+        if (!mounted) return;
+        if (!selectResult.success) {
+          // CHẶN operator: không cập nhật _selectedModelId, không pop về màn
+          // trước - gateway vẫn đang chạy mã hàng cũ, để operator tiếp tục
+          // như đã chọn xong sẽ chạy nhầm model YOLO + calib.
+          await showDialog(
+            context: context,
+            builder: (BuildContext context) {
+              return AlertDialog(
+                icon: const Icon(Icons.error, color: Colors.red, size: 48),
+                title: const Text('Không thể đổi mã hàng trên Gateway'),
+                content: Text(
+                  'Mã hàng "$productCode" chưa sẵn sàng trên PLC Gateway:\n\n'
+                  '${selectResult.message}\n\n'
+                  'Gateway vẫn đang chạy mã hàng trước đó. Liên hệ kỹ thuật '
+                  'viên để thêm/sửa mã hàng này trong products_registry.yaml '
+                  'trước khi chạy VRS với mã hàng "$productCode".',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Đóng'),
+                  ),
+                ],
+              );
+            },
+          );
+          return;
+        }
+        vrsProvider.setLastSelectedProductCode(productCode);
+
+        // Báo trước QCamber mở sẵn job của mã hàng này ngay bây giờ (trước khi
+        // máy bắt đầu chạy) - không chờ kết quả, vì đây chỉ là tối ưu độ trễ
+        // cho điểm lỗi đầu tiên (/api/capture) chứ không phải điều kiện bắt
+        // buộc để tiếp tục chọn mã hàng. Không gọi khi selectProduct thất bại
+        // ở trên (đã return) - operator bị chặn với mã hàng đó rồi, mở job
+        // Gerber lúc này là vô ích.
+        unawaited(
+          Provider.of<QCamberGerberService>(
+            context,
+            listen: false,
+          ).preloadJob(productCode),
+        );
+      }
 
       // Update selected model ID for UI highlighting
       setState(() {

@@ -643,6 +643,43 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         layerName: board['layer_id']?.toString() ?? 'l8',
         zoom: 8192.0,
       );
+
+      // QCamber đang mở nhầm file thiết kế mạch (job) so với mã hàng đang
+      // chạy - ảnh Gerber tham chiếu sẽ sai hoàn toàn, operator có thể đối
+      // chiếu lỗi nhầm sang thiết kế của board khác. Đây gọi song song với
+      // bước PLC/AI (không await ở nơi gọi) nên có thể tới muộn hơn 1 nhịp,
+      // nhưng vẫn phải dừng ngay khi phát hiện thay vì chỉ log lặng lẽ như
+      // các lỗi tải Gerber khác.
+      if (_gerberService.wrongJobOpen) {
+        _abortWorkflow(
+          'QCamber đang mở nhầm file thiết kế mạch',
+          showSnackBar: false,
+        );
+        if (mounted) {
+          await showDialog<void>(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) => AlertDialog(
+              icon: const Icon(Icons.error, color: Colors.red, size: 48),
+              title: const Text('Mở nhầm file thiết kế mạch'),
+              content: Text(
+                'QCamber đang mở file "${_gerberService.openJobName}" nhưng '
+                'mã hàng đang chạy cần file '
+                '"${_gerberService.requestedJobNameOnError}".\n\n'
+                'Đã dừng kiểm tra để tránh đối chiếu nhầm thiết kế. Vui lòng '
+                'mở đúng file thiết kế mạch trong QCamber rồi bấm "Bắt đầu" '
+                'lại.',
+              ),
+              actions: [
+                ElevatedButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('Đã hiểu'),
+                ),
+              ],
+            ),
+          );
+        }
+      }
     } catch (e) {
       debugPrint('VRSMainScreen: error loading gerber image: $e');
     }

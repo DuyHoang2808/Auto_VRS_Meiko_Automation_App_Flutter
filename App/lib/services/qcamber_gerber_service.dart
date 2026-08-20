@@ -18,11 +18,23 @@ class QCamberGerberService extends ChangeNotifier {
   // ảnh Gerber của defect trước đó).
   int _requestId = 0;
 
+  // QCamber trả HTTP 409 kèm {currentJobName, requestedJobName, ...} khi file
+  // thiết kế đang mở trong QCamber KHÁC với mã hàng đang chạy - tức operator
+  // (hoặc ai đó) đã mở nhầm file thiết kế mạch. Tách riêng khỏi `_lastError`
+  // (chỉ là chuỗi hiển thị) để màn hình gọi phân biệt được với lỗi tải ảnh
+  // thông thường và có thể cảnh báo rõ + dừng chu trình.
+  bool _wrongJobOpen = false;
+  String? _openJobName;
+  String? _requestedJobNameOnError;
+
   bool get isLoading => _isLoading;
   String? get lastError => _lastError;
   Uint8List? get gerberImage => _gerberImage;
   Map<String, dynamic>? get lastMetadata => _lastMetadata;
   bool get hasImage => _gerberImage != null;
+  bool get wrongJobOpen => _wrongJobOpen;
+  String? get openJobName => _openJobName;
+  String? get requestedJobNameOnError => _requestedJobNameOnError;
   String get _baseUrl => AppRuntimeConfig.instance.qcamberBaseUrl;
 
   /// Cắt ngắn body của response để đưa vào log / `lastError`.
@@ -43,6 +55,55 @@ class QCamberGerberService extends ChangeNotifier {
       return response.statusCode == 200;
     } catch (e) {
       return false;
+    }
+  }
+
+  /// Báo trước cho QCamber mở sẵn job [jobName] - gọi ngay khi operator chọn
+  /// model, TRƯỚC khi máy bắt đầu chạy (xem select_model_screen.dart), để lúc
+  /// soi lỗi thật (`captureGerberImage`/`/api/capture`) job đã mở sẵn -
+  /// `ensureJobOpen` phía QCamber bỏ qua toàn bộ bước mở job, nên điểm lỗi
+  /// đầu tiên nhanh như các điểm sau, không còn bị delay do phải mở job.
+  ///
+  /// Không chụp ảnh gì cả, chỉ mở/chuyển job rồi trả về ngay. An toàn khi gọi
+  /// nhiều lần cho cùng 1 job - QCamber trả `alreadyOpen:true` gần như tức
+  /// thì nếu job đó đã mở sẵn, không tốn công mở lại. Timeout dài (job có thể
+  /// mất vài chục giây để mở lần đầu) nhưng bên gọi nên gọi không chờ
+  /// (`unawaited`) vì đây chỉ là tối ưu độ trễ, không phải điều kiện bắt buộc.
+  Future<PreloadJobResponse> preloadJob(String jobName) async {
+    try {
+      debugPrint('🔍 QCamber: Preloading job=$jobName');
+
+      final response = await http
+          .post(
+            Uri.parse('$_baseUrl/api/preload'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'jobName': jobName}),
+          )
+          .timeout(const Duration(seconds: 60));
+
+      if (response.statusCode == 200) {
+        final result = PreloadJobResponse.fromJson(jsonDecode(response.body));
+        debugPrint(
+          '✅ QCamber Preload: job=$jobName alreadyOpen=${result.alreadyOpen}',
+        );
+        return result;
+      }
+
+      final message =
+          'HTTP ${response.statusCode}: ${_shortBody(response.body)}';
+      debugPrint('❌ QCamber Preload Error: $message');
+      return PreloadJobResponse(
+        success: false,
+        jobName: jobName,
+        message: message,
+      );
+    } catch (e) {
+      debugPrint('❌ QCamber Preload Exception: $e');
+      return PreloadJobResponse(
+        success: false,
+        jobName: jobName,
+        message: 'Error: $e',
+      );
     }
   }
 
@@ -70,6 +131,9 @@ class QCamberGerberService extends ChangeNotifier {
     _lastError = null;
     _gerberImage = null;
     _lastMetadata = null;
+    _wrongJobOpen = false;
+    _openJobName = null;
+    _requestedJobNameOnError = null;
     notifyListeners();
 
     try {
@@ -129,6 +193,26 @@ class QCamberGerberService extends ChangeNotifier {
         // Cắt ngắn body: cùng lý do như nhánh JSON bên dưới.
         _lastError = 'HTTP ${response.statusCode}: ${_shortBody(response.body)}';
         debugPrint('❌ QCamber Error: $_lastError');
+
+        // QCamber báo đang mở SAI file thiết kế (job) so với mã hàng đang
+        // chạy - ảnh Gerber hiển thị sẽ là của board KHÁC, nguy hiểm hơn hẳn
+        // 1 lỗi tải ảnh thông thường vì operator có thể đối chiếu nhầm thiết
+        // kế. Nhận diện qua đúng shape QCamber trả (409 + currentJobName +
+        // requestedJobName) thay vì so khớp chuỗi `error` - bền hơn nếu message
+        // đổi chữ.
+        if (response.statusCode == 409) {
+          try {
+            final decoded = jsonDecode(response.body);
+            if (decoded is Map &&
+                decoded['currentJobName'] != null &&
+                decoded['requestedJobName'] != null) {
+              _wrongJobOpen = true;
+              _openJobName = decoded['currentJobName'].toString();
+              _requestedJobNameOnError = decoded['requestedJobName'].toString();
+            }
+          } catch (_) {}
+        }
+
         _isLoading = false;
         notifyListeners();
         return false;
@@ -298,6 +382,32 @@ class QCamberGerberService extends ChangeNotifier {
   void dispose() {
     clearImage();
     super.dispose();
+  }
+}
+
+/// Response from POST /api/preload
+class PreloadJobResponse {
+  final bool success;
+  final String? jobName;
+  final bool alreadyOpen;
+  final String? requestId;
+  final String? message;
+
+  PreloadJobResponse({
+    required this.success,
+    this.jobName,
+    this.alreadyOpen = false,
+    this.requestId,
+    this.message,
+  });
+
+  factory PreloadJobResponse.fromJson(Map<String, dynamic> json) {
+    return PreloadJobResponse(
+      success: json['status'] == 'ok',
+      jobName: json['jobName']?.toString(),
+      alreadyOpen: json['alreadyOpen'] ?? false,
+      requestId: json['requestId']?.toString(),
+    );
   }
 }
 

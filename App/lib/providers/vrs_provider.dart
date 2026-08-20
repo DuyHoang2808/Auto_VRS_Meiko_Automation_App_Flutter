@@ -9,6 +9,11 @@ class VRSProvider extends ChangeNotifier {
   bool _isAutoMode = true;
   String _currentModel = '';
   String _currentModelName = '';
+  // Mã hàng (product_code) vừa báo THÀNH CÔNG cho PLC Gateway lúc operator
+  // chọn mã hàng (xem select_model_screen.dart). Dùng để các màn hình khác
+  // đối chiếu với GET /api/products/active - phát hiện lệch nếu gateway bị
+  // đổi mã hàng từ nơi khác (vd công cụ calib rời) mà app không hề biết.
+  String? _lastSelectedProductCode;
   String _currentLot = '';
   // Mã lot thật (lot_code từ AOI_Ingest, xem tbLot.lot_code) - tên hiển thị
   // cho vận hành viên, khác với id_lot (khóa DB nội bộ). Lot tạo trước khi
@@ -71,6 +76,7 @@ class VRSProvider extends ChangeNotifier {
   bool get isAutoMode => _isAutoMode;
   String get currentModel => _currentModel;
   String get currentModelName => _currentModelName;
+  String? get lastSelectedProductCode => _lastSelectedProductCode;
   int get totalCount => _totalCount;
   int get okCount => _okCount;
   int get ngCount => _ngCount;
@@ -185,6 +191,25 @@ class VRSProvider extends ChangeNotifier {
   /// (setCurrentModel/khởi động app) hay vận hành viên tự chọn thủ công
   /// (setCurrentModelAndLot) - để logic áp dụng lot luôn nhất quán.
   Future<void> _applyLot(Map<String, dynamic>? lot) async {
+    // Đổi lot/model -> "board tiếp theo" đã tìm thấy trước đó (nếu có) thuộc
+    // về model/lot CŨ, không còn liên quan gì tới board/mặt sắp áp dụng bên
+    // dưới. BUG đã gặp: chuyển từ model A (vừa hoàn tất 1 board nên
+    // nextBoardAvailable=true, trỏ board+mặt của model A) sang model B (đang
+    // dở dang mặt B) - _applyLot set đúng _currentBoard/_currentBoardSide
+    // theo model B, NHƯNG nextBoardAvailable còn true từ model A khiến nút
+    // "Bắt đầu" bị khoá; bấm "Board tiếp theo" thay vào đó thì
+    // advanceToNextBoard() ghi đè _currentBoard/_currentBoardSide vừa set
+    // đúng ở trên bằng board+mặt CŨ của model A -> gateway calib/soi nhầm mặt.
+    // Phải xoá sạch state "board tiếp theo" mỗi khi áp dụng 1 lot/model mới.
+    _nextBoardAvailable = false;
+    _nextBoardIsNewPhysical = false;
+    _nextBoardId = '';
+    _nextBoardCode = '';
+    _nextBoardSide = 'A';
+    _lotFinished = false;
+    _calibrationNeeded = false;
+    _lastCompletedBoardId = '';
+
     if (lot == null) {
       _currentLot = 'Chưa có';
       _currentLotCode = '';
@@ -238,6 +263,16 @@ class VRSProvider extends ChangeNotifier {
     } catch (e) {
       debugPrint('Error setting current model and lot: $e');
     }
+  }
+
+  /// Ghi nhận mã hàng (product_code) vừa báo THÀNH CÔNG cho PLC Gateway - gọi
+  /// từ select_model_screen.dart ngay sau khi `PlcGatewayService.selectProduct`
+  /// trả `success: true`. KHÔNG gọi khi thất bại - lúc đó gateway vẫn đang
+  /// chạy mã hàng cũ, ghi nhận mã hàng mới vào đây sẽ làm màn hình khác so
+  /// sánh sai (tưởng đã khớp trong khi thực ra chưa đổi).
+  void setLastSelectedProductCode(String productCode) {
+    _lastSelectedProductCode = productCode;
+    notifyListeners();
   }
 
   Future<void> _resolveFirstLotAndBoardForModel(String modelId) async {

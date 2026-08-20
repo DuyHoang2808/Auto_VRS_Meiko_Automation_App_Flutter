@@ -486,6 +486,88 @@ class PlcGatewayService {
     return savedBoardId == boardId;
   }
 
+  /// Danh sách mã hàng có trong products_registry.yaml của gateway - dùng để
+  /// hiện danh sách/so sánh, KHÔNG đổi mã hàng đang active.
+  Future<ProductsListResponse> getProducts() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$_resolvedBaseUrl/api/products'))
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        return ProductsListResponse.fromJson(json.decode(response.body));
+      }
+      return ProductsListResponse(products: []);
+    } catch (e) {
+      print('❌ Get products error: $e');
+      return ProductsListResponse(products: []);
+    }
+  }
+
+  /// Mã hàng đang active hiện tại ở gateway - dùng để đối chiếu với mã hàng
+  /// app đang nghĩ là đang chọn (xem `VRSProvider.lastSelectedProductCode`),
+  /// phát hiện lệch nếu gateway bị đổi mã hàng từ nơi khác mà app không biết.
+  Future<ActiveProductResponse> getActiveProduct() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$_resolvedBaseUrl/api/products/active'))
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        return ActiveProductResponse.fromJson(json.decode(response.body));
+      }
+      return ActiveProductResponse();
+    } catch (e) {
+      print('❌ Get active product error: $e');
+      return ActiveProductResponse();
+    }
+  }
+
+  /// Báo cho gateway đổi sang mã hàng [productCode]: gateway sẽ đổi weights
+  /// YOLO của Fiducial Detector Service + trỏ file calib sang đúng thư mục
+  /// của mã hàng này (xem `products_registry.yaml` bên gateway).
+  ///
+  /// AN TOÀN: nếu thất bại (thiếu file weights của mã hàng, fiducial service
+  /// down...), gateway vẫn trả HTTP 200 với `success:false` (trừ mã hàng
+  /// hoàn toàn chưa có trong registry -> HTTP 400) và GIỮ NGUYÊN mã hàng
+  /// đang active trước đó. Bên gọi PHẢI tự chặn operator tiếp tục khi
+  /// `success:false` - không được coi như đã đổi mã hàng xong.
+  Future<ProductSelectResponse> selectProduct(String productCode) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('$_resolvedBaseUrl/api/products/select'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'product_code': productCode}),
+          )
+          .timeout(const Duration(seconds: 40));
+
+      if (response.statusCode == 200) {
+        return ProductSelectResponse.fromJson(json.decode(response.body));
+      }
+
+      String detail = 'HTTP ${response.statusCode}';
+      try {
+        final decoded = json.decode(response.body);
+        if (decoded is Map && decoded['detail'] != null) {
+          detail = decoded['detail'].toString();
+        }
+      } catch (_) {}
+      return ProductSelectResponse(
+        success: false,
+        productCode: productCode,
+        message: detail,
+      );
+    } catch (e) {
+      print('❌ Select product error: $e');
+      return ProductSelectResponse(
+        success: false,
+        productCode: productCode,
+        message: 'Network error: $e',
+      );
+    }
+  }
+
   /// Check if PLC Gateway API is running
   Future<bool> isApiAvailable() async {
     try {
@@ -710,6 +792,74 @@ class AutoBoardOffsetResponse {
       boardId: json['board_id'] as String?,
       boardSide: json['board_side'] as String?,
       timing: json['timing'] as Map<String, dynamic>?,
+    );
+  }
+}
+
+/// Response from GET /api/products
+class ProductsListResponse {
+  final List<String> products;
+  final String? defaultProduct;
+  final String? activeProduct;
+
+  ProductsListResponse({
+    required this.products,
+    this.defaultProduct,
+    this.activeProduct,
+  });
+
+  factory ProductsListResponse.fromJson(Map<String, dynamic> json) {
+    return ProductsListResponse(
+      products:
+          (json['products'] as List?)?.map((e) => e.toString()).toList() ??
+          [],
+      defaultProduct: json['default_product'] as String?,
+      activeProduct: json['active_product'] as String?,
+    );
+  }
+}
+
+/// Response from GET /api/products/active
+class ActiveProductResponse {
+  final String? activeProduct;
+  final Map<String, dynamic>? config;
+
+  ActiveProductResponse({this.activeProduct, this.config});
+
+  factory ActiveProductResponse.fromJson(Map<String, dynamic> json) {
+    return ActiveProductResponse(
+      activeProduct: json['active_product'] as String?,
+      config: json['config'] as Map<String, dynamic>?,
+    );
+  }
+}
+
+/// Response from POST /api/products/select
+class ProductSelectResponse {
+  final bool success;
+  final String productCode;
+  final String message;
+  final String? weightsPath;
+  final String? calibDir;
+  final Map<String, dynamic>? fiducialClassNames;
+
+  ProductSelectResponse({
+    required this.success,
+    required this.productCode,
+    required this.message,
+    this.weightsPath,
+    this.calibDir,
+    this.fiducialClassNames,
+  });
+
+  factory ProductSelectResponse.fromJson(Map<String, dynamic> json) {
+    return ProductSelectResponse(
+      success: json['success'] ?? false,
+      productCode: json['product_code']?.toString() ?? '',
+      message: json['message']?.toString() ?? '',
+      weightsPath: json['weights_path'] as String?,
+      calibDir: json['calib_dir'] as String?,
+      fiducialClassNames: json['fiducial_class_names'] as Map<String, dynamic>?,
     );
   }
 }
