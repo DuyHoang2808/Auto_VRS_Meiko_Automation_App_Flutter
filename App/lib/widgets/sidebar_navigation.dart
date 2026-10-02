@@ -90,7 +90,12 @@ class SidebarNavigation extends StatelessWidget {
         title: 'Cài đặt Model',
         icon: FeatherIcons.settings,
         route: '/select-model',
-        requiredAuth: 'admin',
+        // Worker được vào để chọn model/lot/đợt board chạy - thao tác sửa
+        // (kích thước Line/Space, url_gerber), thêm mã hàng mới, xóa mã
+        // hàng, quản lý/xóa board đều yêu cầu xác thực Admin riêng ngay tại
+        // nút bấm (xem select_model_screen.dart), không phụ thuộc vào gate
+        // ở cấp màn hình này.
+        requiredAuth: 'worker',
       ),
       NavigationItem(
         title: 'Giám sát Auto VRS',
@@ -168,11 +173,7 @@ class SidebarNavigation extends StatelessWidget {
                       ),
                     ),
                     if (!isAccessible)
-                      Icon(
-                        FeatherIcons.lock,
-                        color: disabledColor,
-                        size: 16,
-                      ),
+                      Icon(FeatherIcons.lock, color: disabledColor, size: 16),
                   ],
                 ),
               ),

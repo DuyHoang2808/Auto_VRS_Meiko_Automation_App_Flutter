@@ -322,6 +322,37 @@ class QCamberGerberService extends ChangeNotifier {
   /// 1. JSON format: '{"x": 150.5, "y": 250.3}'
   /// 2. Comma format: '180.3,95.1'
   /// 3. Semicolon format: '1.518795;2.0109942'
+  /// Tên "job" QCamber thật sự dùng để mở file thiết kế (jobName gửi tới
+  /// `/api/capture`, `/api/preload`) - suy ra từ 1 hàng model (`tbModel`),
+  /// KHÔNG LUÔN LÀ `model['name']`.
+  ///
+  /// Đôi khi tên mã hàng (`name`) không trùng tên thư mục job thật trong
+  /// QCamber (dưới `Jobs\`) - gọi QCamber bằng `name` lúc đó sẽ mở nhầm/không
+  /// mở được job (xem `wrongJobOpen`/HTTP 409 ở trên). Operator có thể điền
+  /// `url_gerber` = đường dẫn ĐẦY ĐỦ tới thư mục job thật (vd
+  /// `D:\...\Qcamber-Meiko\bin\Jobs\23691025-250616-0004-nvq-aoi`) ở màn sửa
+  /// mã hàng - tên job dùng khi đó là tên thư mục CUỐI CÙNG của đường dẫn đó
+  /// (basename), không phải cả đường dẫn.
+  ///
+  /// `url_gerber` rỗng/null (mặc định, mã hàng chưa cần cấu hình riêng) ->
+  /// vẫn dùng `model['name']` như trước, không đổi hành vi cho mã hàng nào
+  /// chưa cấu hình gì.
+  static String resolveJobName(Map<String, dynamic> model) {
+    final fallback = model['name']?.toString() ?? 'Model_${model['id_model']}';
+    final urlGerber = model['url_gerber']?.toString().trim() ?? '';
+    if (urlGerber.isEmpty) return fallback;
+
+    // Chuẩn hoá '/' về '\' (operator có thể dán đường dẫn kiểu '/' nếu copy
+    // từ nơi khác) rồi lấy đoạn cuối cùng không rỗng - basename thủ công vì
+    // đường dẫn ở đây luôn là chuỗi Windows/UNC do operator nhập tay, không
+    // phải file cục bộ trên máy chạy app này (`dart:io`'s `path` package giả
+    // định phân tách theo OS hiện tại, không phù hợp để phân tích 1 đường dẫn
+    // Windows nhập tay khi app có thể build cho nền tảng khác).
+    final normalized = urlGerber.replaceAll('/', '\\');
+    final segments = normalized.split('\\').where((s) => s.isNotEmpty).toList();
+    return segments.isNotEmpty ? segments.last : fallback;
+  }
+
   static Map<String, dynamic>? parseCoordinatesString(String coordinatesStr) {
     try {
       if (coordinatesStr.isEmpty) return null;

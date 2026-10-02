@@ -4,6 +4,58 @@ import 'package:autovrs_app/core/app_runtime_config.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter/foundation.dart';
 
+/// Bộ loại lỗi CHUẨN của mô hình AI - chép đúng từ `class_names_vi` trong
+/// `BE_tensorRT/ai_detection_api.py` (key = tên lớp mô hình dùng, value = tên
+/// hiển thị tiếng Việt cho người vận hành).
+///
+/// Dùng làm danh sách cho người vận hành chọn loại lỗi khi phán định NG ở VRS
+/// Thủ công. LƯU vào DB (`tbDefect.human_type`) là KEY, không phải value: nhãn
+/// phải trùng đúng tên lớp mô hình thì sau này mới đem đi huấn luyện/đánh giá
+/// lại được. Cột `ai_type` cũ đang lẫn cả 2 cách viết cho cùng 1 loại lỗi
+/// ('DiVat' lẫn 'Di Vat') vì code cũ ghi `classNameVi` - đó là lý do cột mới
+/// chỉ nhận key.
+///
+/// Nếu mô hình đổi bộ lớp, sửa file Python TRƯỚC rồi đồng bộ lại đây.
+const Map<String, String> kDefectClassNames = {
+  'BamDinhKhongTot': 'Bám Dính Không Tốt',
+  'ChamKim': 'Châm Kim',
+  'DiVat': 'Dị Vật',
+  'DiVatDuongMach': 'Dị Vật Đường Mạch',
+  'KhuyetMach': 'Khuyết Mạch',
+  'NganMach': 'Ngắn Mạch',
+  'ThieuDong': 'Thiếu Đồng',
+  'ThieuDongDuongMach': 'Thiếu Đồng Đường Mạch',
+  'ThuaDong': 'Thừa Đồng',
+  'ThuaDongDuongMach': 'Thừa Đồng Đường Mạch',
+  'VetLom': 'Vết Lõm',
+  'Xuoc': 'Xước',
+  'Other': 'Khác',
+};
+
+/// Đưa 1 chuỗi loại lỗi bất kỳ về đúng KEY trong [kDefectClassNames].
+///
+/// Cần thiết vì cùng 1 loại lỗi đang tồn tại nhiều cách viết trong hệ thống:
+/// tên lớp mô hình ('ThieuDong'), tên tiếng Việt KHÔNG dấu backend trả về ở
+/// `class_name_vi` ('Thieu Dong'), và tên tiếng Việt CÓ dấu app hiển thị
+/// ('Thiếu Đồng'). Bỏ hết dấu cách rồi so không phân biệt hoa thường với CẢ
+/// key lẫn value nên cả 3 dạng đều về đúng 1 key (so với value là cách bắt
+/// dạng có dấu mà không cần bảng bỏ dấu tiếng Việt).
+///
+/// Trả `null` nếu không khớp lớp nào (vd dữ liệu cũ 'none', chuỗi rỗng) - khi
+/// đó KHÔNG đoán bừa, để người vận hành tự chọn.
+String? canonicalDefectClass(String? raw) {
+  final value = raw?.trim();
+  if (value == null || value.isEmpty) return null;
+  final needle = value.replaceAll(' ', '').toLowerCase();
+  for (final entry in kDefectClassNames.entries) {
+    if (entry.key.toLowerCase() == needle) return entry.key;
+    if (entry.value.replaceAll(' ', '').toLowerCase() == needle) {
+      return entry.key;
+    }
+  }
+  return null;
+}
+
 class AIDetectionResult {
   final bool success;
   final String message;
@@ -42,6 +94,58 @@ class AIDetectionResult {
       ),
     );
   }
+
+  /// Verdict OK/NG THẬT SỰ do backend quyết định (`statistics.system_verdict`
+  /// - xem ai_detection_api.py::format_results, tính là "NG nếu có ÍT NHẤT 1
+  /// detection với verdict='NG'", KHÔNG PHẢI "có detection nào là NG").
+  ///
+  /// KHÔNG được suy verdict chỉ từ `detections.isEmpty` - 1 detection có thể
+  /// ĐƯỢC TRẢ VỀ (vẽ lên ảnh, liệt kê trong `detections[]`) nhưng verdict
+  /// riêng của NÓ vẫn là 'OK' (vd nghi ngờ ban đầu nhưng đo đạc/phân loại lại
+  /// xác nhận nằm trong dung sai) - bug thật đã gặp 2026-09-25: ảnh có 1
+  /// detection "ThieuDong" nhưng backend log "Overall verdict: OK", trong khi
+  /// app Flutter (dùng detections.isEmpty) lại báo NG.
+  ///
+  /// Fallback về suy luận cũ (detections rỗng = OK) CHỈ khi response thiếu
+  /// hẳn field này (backend cũ hơn/khác) - để không vỡ hoàn toàn nếu thiếu.
+  String get systemVerdict {
+    final raw = statistics['system_verdict']?.toString();
+    if (raw != null && raw.isNotEmpty) return raw.toUpperCase();
+    return detections.isEmpty ? 'OK' : 'NG';
+  }
+
+  /// Tên loại lỗi của lỗi NG "chính" - lỗi NG có confidence cao nhất trong
+  /// TOÀN BỘ lỗi backend tìm được (`statistics.primary_defect`, xem
+  /// ai_detection_api.py::format_results).
+  ///
+  /// BẮT BUỘC phải dùng tới, không được chỉ dựa vào `detections`: backend chỉ
+  /// trả về TOP-N lỗi theo confidence trong `detections[]`
+  /// (`max_defects_drawn`, hiện là 3 trong ai_config.yml) trong khi
+  /// `system_verdict` tính trên TẤT CẢ lỗi. Nếu lỗi gây ra NG có confidence
+  /// thấp hơn 3 lỗi verdict=OK khác thì nó KHÔNG nằm trong `detections[]`:
+  /// app báo "NG" mà lọc `detections` theo verdict=='NG' lại chẳng thấy gì,
+  /// hiện ra "NG / Không phát hiện lỗi" và ghi `ai_type` rỗng vào DB (bug
+  /// thật đã gặp, có dòng trong DB ngày 2026-09-30).
+  ///
+  /// Trả `null` khi verdict là OK (backend để `primary_defect` = null) hoặc
+  /// response cũ không có field này.
+  String? get primaryDefectName {
+    final raw = statistics['primary_defect'];
+    if (raw is! Map) return null;
+    final vi = raw['class_name_vi']?.toString().trim();
+    if (vi != null && vi.isNotEmpty) return vi;
+    final en = raw['class_name']?.toString().trim();
+    return (en != null && en.isNotEmpty) ? en : null;
+  }
+
+  /// Như [primaryDefectName] nhưng trả TÊN LỚP CHUẨN của mô hình (chưa dịch),
+  /// để đối chiếu/chuẩn hoá - xem canonicalDefectClass.
+  String? get primaryDefectClassName {
+    final raw = statistics['primary_defect'];
+    if (raw is! Map) return null;
+    final en = raw['class_name']?.toString().trim();
+    return (en != null && en.isNotEmpty) ? en : null;
+  }
 }
 
 class DefectDetection {
@@ -51,6 +155,10 @@ class DefectDetection {
   final String className;
   final String classNameVi;
   final Map<String, int> coordinates;
+  // Verdict OK/NG RIÊNG của detection này (xem ai_detection_api.py::
+  // format_results) - 1 detection được trả về/vẽ lên ảnh KHÔNG có nghĩa nó
+  // là NG, có thể tự nó đã là 'OK' (xem AIDetectionResult.systemVerdict).
+  final String verdict;
 
   DefectDetection({
     required this.bbox,
@@ -59,6 +167,7 @@ class DefectDetection {
     required this.className,
     required this.classNameVi,
     required this.coordinates,
+    required this.verdict,
   });
 
   factory DefectDetection.fromJson(Map<String, dynamic> json) {
@@ -69,6 +178,7 @@ class DefectDetection {
       className: json['class_name'] ?? '',
       classNameVi: json['class_name_vi'] ?? '',
       coordinates: Map<String, int>.from(json['coordinates'] ?? {}),
+      verdict: (json['verdict']?.toString() ?? 'NG').toUpperCase(),
     );
   }
 }
@@ -87,6 +197,11 @@ class AIDetectionService extends ChangeNotifier {
     required Uint8List imageData,
     double confidenceThreshold = 0.25,
     double iouThreshold = 0.1,
+    // Ma lo (tbLot.lot_code) + ma board (tbBoard.board_code) hien tai, de BE
+    // gan vao ten file anh log + inspection_log.jsonl. De trong neu chua co
+    // lo/board (vd test thu cong ngoai luong AOI).
+    String lotCode = '',
+    String boardCode = '',
   }) async {
     _isLoading = true;
     _lastError = null;
@@ -101,6 +216,8 @@ class AIDetectionService extends ChangeNotifier {
         'image_base64': base64Image,
         'confidence_threshold': confidenceThreshold,
         'iou_threshold': iouThreshold,
+        'lot_code': lotCode,
+        'board_code': boardCode,
       };
 
       debugPrint('🤖 Sending AI detection request...');

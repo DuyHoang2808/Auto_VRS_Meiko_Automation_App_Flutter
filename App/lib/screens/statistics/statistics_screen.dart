@@ -32,6 +32,16 @@ class StatisticsScreen extends StatelessWidget {
             color: Colors.teal.shade500,
             route: '/select-lot',
           ),
+          _buildStatisticsCard(
+            context,
+            title: 'Độ khớp AI vs Người',
+            description:
+                'Xem AI báo thừa/báo thiếu bao nhiêu so với phán định cuối '
+                'của người vận hành, lọc theo lô và khoảng ngày.',
+            icon: FeatherIcons.activity,
+            color: Colors.blue.shade500,
+            route: '/ai-agreement',
+          ),
         ],
       ),
     );

@@ -23,6 +23,8 @@ class FeatherIcons {
   static const IconData list = Icons.list;
   static const IconData lock = Icons.lock_outline;
   static const IconData logOut = Icons.logout;
+  static const IconData menu = Icons.menu;
+  static const IconData menuOpen = Icons.menu_open;
   static const IconData monitor = Icons.desktop_windows_outlined;
   static const IconData moon = Icons.dark_mode_outlined;
   static const IconData navigation = Icons.navigation_outlined;

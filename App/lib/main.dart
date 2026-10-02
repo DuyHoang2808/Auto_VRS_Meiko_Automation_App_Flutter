@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -10,6 +11,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'core/app_runtime_config.dart';
 import 'core/app_theme.dart';
 import 'core/routes.dart';
+import 'providers/aoi_machine_provider.dart';
 import 'providers/auth_provider.dart';
 import 'providers/navigation_provider.dart';
 import 'providers/statistics_provider.dart';
@@ -38,13 +40,21 @@ void main() async {
     return false;
   };
 
-  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+  // Platform.isWindows/isLinux/isMacOs (dart:io) NÉM EXCEPTION ngay khi ĐỌC
+  // (không cần gọi gì thêm) trên web - "Unsupported operation:
+  // Platform._operatingSystem". Khác các Platform-check khác trong file này
+  // vốn đã nằm trong try/catch (lỗi bị nuốt, app vẫn tiếp tục), khối if này
+  // đứng NGOÀI try/catch nên ném lỗi là app treo cứng ngay dòng đầu tiên của
+  // main() - đã gặp thật khi thử `flutter run -d chrome`. kIsWeb (từ
+  // package:flutter/foundation.dart, hằng số biên dịch) chặn TRƯỚC khi
+  // Platform.isWindows kịp được đọc nhờ short-circuit `&&`.
+  if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   }
 
   try {
-    if (Platform.isWindows) {
+    if (!kIsWeb && Platform.isWindows) {
       final directory = Directory.current;
       await Hive.initFlutter('${directory.path}/hive_data');
     } else {
@@ -109,7 +119,13 @@ class AutoVRSApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => NavigationProvider()),
         ChangeNotifierProvider(create: (_) => AuthProvider()),
         ChangeNotifierProvider(create: (_) => ThemeProvider()),
-        ChangeNotifierProvider(create: (_) => VRSProvider()),
+        // Phải khai báo TRƯỚC VRSProvider - VRSProvider đọc qua context.read
+        // ngay trong create() của nó bên dưới (Provider hỗ trợ đọc 1 provider
+        // đã khai báo trước đó trong cùng danh sách).
+        ChangeNotifierProvider(create: (_) => AoiMachineProvider()),
+        ChangeNotifierProvider(
+          create: (context) => VRSProvider(context.read<AoiMachineProvider>()),
+        ),
         ChangeNotifierProvider(create: (_) => StatisticsProvider()),
         ChangeNotifierProvider(create: (_) => AutoVRSWebSocketService()),
         ChangeNotifierProvider(create: (_) => AIDetectionService()),

@@ -251,7 +251,9 @@ class _HomeScreenState extends State<HomeScreen> {
         icon: FeatherIcons.settings,
         route: '/select-model',
         color: Colors.blue,
-        enabled: authProvider.canAccessFeature('admin'),
+        // Worker được vào chọn model/lot/đợt board - sửa/xóa/thêm mã hàng
+        // yêu cầu Admin riêng tại nút bấm (xem sidebar_navigation.dart).
+        enabled: authProvider.canAccessFeature('worker'),
       ),
       QuickAction(
         title: 'Auto VRS',

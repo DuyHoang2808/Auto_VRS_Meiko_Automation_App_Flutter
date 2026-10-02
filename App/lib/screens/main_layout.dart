@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:autovrs_app/core/feather_icons.dart';
 import 'package:go_router/go_router.dart';
+import '../providers/aoi_machine_provider.dart';
 import '../providers/navigation_provider.dart';
 import '../providers/auth_provider.dart';
 import '../providers/theme_provider.dart';
+import '../providers/vrs_provider.dart';
 import '../widgets/sidebar_navigation.dart';
 import '../widgets/password_dialog.dart';
+import '../widgets/aoi_machine_dialog.dart';
 
 class MainLayout extends StatelessWidget {
   final Widget child;
@@ -15,11 +18,16 @@ class MainLayout extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isSidebarVisible = context
+        .watch<NavigationProvider>()
+        .isSidebarVisible;
     return Scaffold(
       body: Row(
         children: [
-          // Sidebar Navigation
-          const SidebarNavigation(),
+          // Sidebar Navigation - ẩn/hiện được qua nút ở top bar (xem
+          // _buildTopBar), state nằm ở NavigationProvider để không mất lựa
+          // chọn khi chuyển route (MainLayout bị tạo lại mỗi lần điều hướng).
+          if (isSidebarVisible) const SidebarNavigation(),
 
           // Main Content Area
           Expanded(
@@ -63,6 +71,21 @@ class MainLayout extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Row(
               children: [
+                // Ẩn/hiện thanh menu bên trái - luôn hiện (không phụ thuộc
+                // canGoBack) để operator luôn có cách mở lại sidebar.
+                IconButton(
+                  onPressed: navigationProvider.toggleSidebar,
+                  icon: Icon(
+                    navigationProvider.isSidebarVisible
+                        ? FeatherIcons.menuOpen
+                        : FeatherIcons.menu,
+                  ),
+                  color: Colors.white,
+                  tooltip: navigationProvider.isSidebarVisible
+                      ? 'Ẩn menu'
+                      : 'Hiện menu',
+                ),
+
                 // Back Button
                 if (navigationProvider.canGoBack)
                   IconButton(
@@ -85,6 +108,12 @@ class MainLayout extends StatelessWidget {
                     ),
                   ),
                 ),
+
+                // Máy AOI đang chọn - đổi được bất cứ lúc nào, xem
+                // _buildAoiMachineChip.
+                _buildAoiMachineChip(context),
+
+                const SizedBox(width: 16),
 
                 // Current Time
                 _buildCurrentTime(),
@@ -113,6 +142,49 @@ class MainLayout extends StatelessWidget {
                 // User Menu
                 _buildUserMenu(context),
               ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Chip hiện máy AOI đang chọn (xem AoiMachineProvider) - bấm để đổi bất
+  /// cứ lúc nào, không chỉ lúc bắt buộc chọn lần đầu ở SelectModelScreen.
+  /// Đặt ở top bar (hiện trên MỌI màn hình qua MainLayout) để vận hành viên
+  /// luôn biết đang xem dữ liệu của máy nào.
+  Widget _buildAoiMachineChip(BuildContext context) {
+    return Consumer<AoiMachineProvider>(
+      builder: (context, aoiMachineProvider, _) {
+        final selected = aoiMachineProvider.selectedMachine;
+        return OutlinedButton.icon(
+          onPressed: () async {
+            final previous = aoiMachineProvider.selectedMachine;
+            final result = await AoiMachineDialog.show(context);
+            // Đổi máy -> reset sạch model/lot/board/đợt đang chọn (bẫy đã
+            // biết - dữ liệu của máy cũ hoàn toàn không liên quan tới máy
+            // mới). KHÔNG reset nếu operator huỷ (result null) hoặc chọn lại
+            // đúng máy cũ.
+            if (result != null && result != previous && context.mounted) {
+              await context.read<VRSProvider>().resetSelection();
+            }
+          },
+          icon: Icon(
+            FeatherIcons.monitor,
+            size: 16,
+            color: selected == null ? Colors.orangeAccent : Colors.white,
+          ),
+          label: Text(
+            selected == null ? 'Chưa chọn máy' : 'Máy: $selected',
+            style: TextStyle(
+              color: selected == null ? Colors.orangeAccent : Colors.white,
+            ),
+          ),
+          style: OutlinedButton.styleFrom(
+            side: BorderSide(
+              color: selected == null
+                  ? Colors.orangeAccent
+                  : Colors.white.withValues(alpha: 0.6),
             ),
           ),
         );

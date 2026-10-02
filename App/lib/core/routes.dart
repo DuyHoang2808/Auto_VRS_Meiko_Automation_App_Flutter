@@ -3,6 +3,8 @@ import '../screens/main_layout.dart';
 import '../screens/home_screen.dart';
 import '../screens/model_management/select_model_screen.dart';
 import '../screens/model_management/select_lot_for_model_screen.dart';
+import '../screens/model_management/select_board_batch_screen.dart';
+import '../screens/model_management/manage_boards_screen.dart';
 import '../screens/model_management/add_model_screen.dart';
 import '../screens/vrs/vrs_main_screen.dart';
 import '../screens/vrs/manual_vrs_screen.dart';
@@ -12,6 +14,7 @@ import '../screens/statistics/statistics_screen.dart';
 import '../screens/statistics/ng_rate_screen.dart';
 import '../screens/statistics/select_lot_screen.dart';
 import '../screens/statistics/defect_type_screen.dart';
+import '../screens/statistics/ai_agreement_screen.dart';
 import '../screens/camera_screen.dart';
 
 class AppRoutes {
@@ -43,6 +46,35 @@ class AppRoutes {
         builder: (context, state) => MainLayout(
           child: SelectLotForModelScreen(
             modelId: state.pathParameters['modelId']!,
+          ),
+        ),
+      ),
+      GoRoute(
+        // Đẩy sang từ SelectModelScreen ngay sau khi có idLot, CHỈ khi lot đó
+        // chưa có đợt nào đang chạy (xem LocalDatabaseService.
+        // getActiveBatchForLot) - vận hành viên chọn khoảng board (đợt) sẽ
+        // nạp lên máy VRS thật lần này. Trả về id_batch vừa tạo qua
+        // context.pop(idBatch) - xem SelectBoardBatchScreen.
+        path: '/select-board-batch/:idLot',
+        name: 'select_board_batch',
+        builder: (context, state) => MainLayout(
+          child: SelectBoardBatchScreen(
+            idLot: int.parse(state.pathParameters['idLot']!),
+          ),
+        ),
+      ),
+      GoRoute(
+        // Đẩy sang từ SelectModelScreen (nút "Quản lý board" mỗi hàng mã
+        // hàng, đã yêu cầu Admin xác thực trước) -> SelectLotForModelScreen
+        // (chọn lot) -> màn này, liệt kê board pending của lot đó kèm nút
+        // xoá. KHÔNG đi qua setCurrentModelAndLot/PlcGatewayService.selectProduct
+        // - thuần công cụ quản lý dữ liệu, không đổi mã hàng đang chạy trên
+        // PLC Gateway. Xem ManageBoardsScreen.
+        path: '/manage-boards/:idLot',
+        name: 'manage_boards',
+        builder: (context, state) => MainLayout(
+          child: ManageBoardsScreen(
+            idLot: int.parse(state.pathParameters['idLot']!),
           ),
         ),
       ),
@@ -97,6 +129,12 @@ class AppRoutes {
             lotId: int.tryParse(state.uri.queryParameters['lot'] ?? ''),
           ),
         ),
+      ),
+      GoRoute(
+        path: '/ai-agreement',
+        name: 'ai_agreement',
+        builder: (context, state) =>
+            const MainLayout(child: AiAgreementScreen()),
       ),
       GoRoute(
         path: '/camera',

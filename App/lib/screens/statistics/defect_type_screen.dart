@@ -30,7 +30,7 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
 
   /// Tên loại lỗi để hiện cho người vận hành.
   String _displayName(String key) {
-    if (key == kUnjudgedDefectKey) return 'Chưa soi';
+    if (key == kUnjudgedDefectKey) return 'Chưa Xử Lý';
     switch (key.toLowerCase()) {
       case 'bamdinhkhongtot':
         return 'Bám Dính Không Tốt';
@@ -126,8 +126,8 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
     final scope = lotId == null
         ? 'Phạm vi: tất cả các lô'
         : 'Phạm vi: lô ${_lotLabel(statsProvider, lotId)}';
-    if (unjudged == 0) return '$scope · đã soi hết';
-    return '$scope · còn $unjudged lỗi chưa soi (chưa có loại lỗi)';
+    if (unjudged == 0) return '$scope · đã kiểm tra hết';
+    return '$scope · còn $unjudged lỗi chưa xử lý (chưa có loại lỗi)';
   }
 
   /// Mã lot hiển thị cho 1 id_lot - tái dùng `statsProvider.lots` (đã có
@@ -174,7 +174,7 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
 
   Widget _buildDefectContent(StatisticsProvider statsProvider) {
     final defectEntries = statsProvider.defectData.entries.toList();
-    
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -238,11 +238,15 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
                                   PieChartData(
                                     sections: defectEntries.map((entry) {
                                       final color = _getDefectColor(entry.key);
-                                      final percentage = (entry.value / statsProvider.totalDefects) * 100;
+                                      final percentage =
+                                          (entry.value /
+                                              statsProvider.totalDefects) *
+                                          100;
                                       return PieChartSectionData(
                                         color: color,
                                         value: entry.value.toDouble(),
-                                        title: '${percentage.toStringAsFixed(1)}%',
+                                        title:
+                                            '${percentage.toStringAsFixed(1)}%',
                                         radius: 60,
                                         titleStyle: const TextStyle(
                                           fontSize: 12,
@@ -301,40 +305,51 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
                                         ),
                                       ),
                                     ],
-                                    rows: defectEntries.map((entry) => DataRow(
-                                      cells: [
-                                        DataCell(
-                                          Row(
-                                            children: [
-                                              Container(
-                                                width: 16,
-                                                height: 16,
-                                                decoration: BoxDecoration(
-                                                  color: _getDefectColor(entry.key),
-                                                  borderRadius: BorderRadius.circular(2),
+                                    rows: defectEntries
+                                        .map(
+                                          (entry) => DataRow(
+                                            cells: [
+                                              DataCell(
+                                                Row(
+                                                  children: [
+                                                    Container(
+                                                      width: 16,
+                                                      height: 16,
+                                                      decoration: BoxDecoration(
+                                                        color: _getDefectColor(
+                                                          entry.key,
+                                                        ),
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              2,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                    const SizedBox(width: 8),
+                                                    Expanded(
+                                                      child: Text(
+                                                        _displayName(entry.key),
+                                                        style: const TextStyle(
+                                                          fontSize: 12,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ],
                                                 ),
                                               ),
-                                              const SizedBox(width: 8),
-                                              Expanded(
-                                                child: Text(
-                                                  _displayName(entry.key),
-                                                  style: const TextStyle(fontSize: 12),
+                                              DataCell(
+                                                Text(
+                                                  entry.value.toString(),
+                                                  style: const TextStyle(
+                                                    fontWeight: FontWeight.w500,
+                                                    fontSize: 12,
+                                                  ),
                                                 ),
                                               ),
                                             ],
                                           ),
-                                        ),
-                                        DataCell(
-                                          Text(
-                                            entry.value.toString(),
-                                            style: const TextStyle(
-                                              fontWeight: FontWeight.w500,
-                                              fontSize: 12,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    )).toList(),
+                                        )
+                                        .toList(),
                                   ),
                                 ),
                               ),
@@ -413,15 +428,18 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
                                     ],
                                   ),
                                 ),
-                                
+
                                 // Data rows
                                 Expanded(
                                   child: ListView.builder(
                                     itemCount: defectEntries.length,
                                     itemBuilder: (context, index) {
                                       final entry = defectEntries[index];
-                                      final percentage = (entry.value / statsProvider.totalDefects) * 100;
-                                      
+                                      final percentage =
+                                          (entry.value /
+                                              statsProvider.totalDefects) *
+                                          100;
+
                                       return Container(
                                         padding: const EdgeInsets.all(12),
                                         decoration: BoxDecoration(
@@ -442,14 +460,21 @@ class _DefectTypeScreenState extends State<DefectTypeScreen> {
                                                     width: 12,
                                                     height: 12,
                                                     decoration: BoxDecoration(
-                                                      color: _getDefectColor(entry.key),
-                                                      borderRadius: BorderRadius.circular(2),
+                                                      color: _getDefectColor(
+                                                        entry.key,
+                                                      ),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            2,
+                                                          ),
                                                     ),
                                                   ),
                                                   const SizedBox(width: 8),
                                                   Text(
                                                     _displayName(entry.key),
-                                                    style: const TextStyle(fontSize: 14),
+                                                    style: const TextStyle(
+                                                      fontSize: 14,
+                                                    ),
                                                   ),
                                                 ],
                                               ),

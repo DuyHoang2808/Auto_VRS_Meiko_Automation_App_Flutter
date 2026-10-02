@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
-import 'package:autovrs_app/core/feather_icons.dart';
 import '../../services/local_database_service.dart';
+import '../../services/qcamber_gerber_service.dart';
 import 'package:go_router/go_router.dart';
-import '../../main.dart';
 
 class AddModelScreen extends StatefulWidget {
   const AddModelScreen({super.key});
@@ -18,7 +17,7 @@ class _AddModelScreenState extends State<AddModelScreen> {
   final _lineSizeController = TextEditingController();
   final _spaceSizeController = TextEditingController();
 
-  String? _selectedFile;
+  final _urlGerberController = TextEditingController();
 
   @override
   Widget build(BuildContext context) {
@@ -75,6 +74,7 @@ class _AddModelScreenState extends State<AddModelScreen> {
                         }
                         return null;
                       },
+                      onChanged: (_) => setState(() {}),
                     ),
 
                     const SizedBox(height: 24),
@@ -125,64 +125,43 @@ class _AddModelScreenState extends State<AddModelScreen> {
 
                     const SizedBox(height: 24),
 
-                    // File Upload
+                    // Đường dẫn file thiết kế - CHỈ cần điền khi tên mã hàng
+                    // ở trên KHÁC tên thư mục job thật trong QCamber (dưới
+                    // Jobs\). Để trống thì QCamber dùng thẳng "Tên mã hàng"
+                    // làm tên job (hành vi mặc định trước đây, không đổi).
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         const Text(
-                          'Đường dẫn file Gerber (url_gerber)',
+                          'Đường dẫn file thiết kế (nếu tên mã hàng KHÁC tên '
+                          'thư mục job trong QCamber)',
                           style: TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.w500,
                           ),
                         ),
                         const SizedBox(height: 8),
-                        Container(
-                          width: double.infinity,
-                          height: 150,
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: Colors.grey.shade300,
-                              style: BorderStyle.solid,
-                              width: 2,
-                            ),
-                            borderRadius: BorderRadius.circular(8),
+                        TextFormField(
+                          controller: _urlGerberController,
+                          decoration: const InputDecoration(
+                            labelText: 'Đường dẫn thư mục job (url_gerber)',
+                            hintText: r'vd D:\...\Qcamber-Meiko\bin\Jobs\'
+                                '23691025-250616-0004-nvq-aoi',
+                            border: OutlineInputBorder(),
                           ),
-                          child: InkWell(
-                            onTap: _selectFile,
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  FeatherIcons.fileText,
-                                  size: 48,
-                                  color: Colors.grey.shade400,
-                                ),
-                                const SizedBox(height: 16),
-                                Text(
-                                  _selectedFile ??
-                                      'Tải tệp lên hoặc kéo và thả',
-                                  style: TextStyle(
-                                    color: _selectedFile != null
-                                        ? Colors.blue.shade600
-                                        : Colors.grey.shade600,
-                                    fontWeight: _selectedFile != null
-                                        ? FontWeight.w500
-                                        : FontWeight.normal,
-                                  ),
-                                ),
-                                if (_selectedFile == null) ...[
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    'Chọn file Gerber (.gbr, .zip)',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.grey.shade500,
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
+                          onChanged: (_) => setState(() {}),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'Tên job QCamber sẽ dùng: '
+                          '${QCamberGerberService.resolveJobName({
+                                'name': _modelNameController.text,
+                                'id_model': _modelIdController.text,
+                                'url_gerber': _urlGerberController.text,
+                              })}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey.shade600,
                           ),
                         ),
                       ],
@@ -229,20 +208,6 @@ class _AddModelScreenState extends State<AddModelScreen> {
     );
   }
 
-  void _selectFile() {
-    // Simulation of file selection
-    setState(() {
-      _selectedFile = 'example_gerber_file.gbr';
-    });
-
-    scaffoldMessengerKey.currentState?.showSnackBar(
-      const SnackBar(
-        content: Text('Chức năng tải file sẽ được triển khai sau'),
-        backgroundColor: Colors.orange,
-      ),
-    );
-  }
-
   void _saveModel() async {
     if (!_formKey.currentState!.validate()) return;
 
@@ -281,7 +246,7 @@ class _AddModelScreenState extends State<AddModelScreen> {
         'name': modelName,
         'line_size': lineSize,
         'space_size': spaceSize,
-        'url_gerber': _selectedFile,
+        'url_gerber': _urlGerberController.text.trim(),
       });
 
       if (!context.mounted) return;
@@ -335,6 +300,7 @@ class _AddModelScreenState extends State<AddModelScreen> {
     _modelNameController.dispose();
     _lineSizeController.dispose();
     _spaceSizeController.dispose();
+    _urlGerberController.dispose();
     super.dispose();
   }
 }

@@ -81,8 +81,14 @@ class StatisticsProvider extends ChangeNotifier {
     try {
       final allLots = await _db.getAllLots();
       _lots = allLots.map((lot) {
+        // lot_code = null cho lot tao truoc migration tbLot.lot_code -
+        // fallback ve kieu nhan cu tu sinh tu id_lot, giong het loadLotStatistics()
+        // o tren. Truoc day cho nay LUON dung 'LOT-<id_lot>' bat ke co lot_code
+        // hay khong, nen man chon lo + dropdown lo trong defect_type_screen
+        // khong bao gio hien dung ma lo (vd "20260915").
+        final lotLabel = lot['lot_code']?.toString() ?? 'LOT-${lot['id_lot']}';
         return {
-          'lot_id': 'LOT-${lot['id_lot']}',
+          'lot_id': lotLabel,
           'model_id': lot['tbModelid_model'] ?? 1,
           'total_boards': lot['board_quantity'] ?? 0,
           'id_lot': lot['id_lot'],

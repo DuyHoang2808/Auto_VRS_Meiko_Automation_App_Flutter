@@ -3,10 +3,21 @@ import 'package:flutter/foundation.dart';
 class NavigationProvider extends ChangeNotifier {
   final List<String> _viewHistory = ['home'];
   String _currentView = 'home';
+  // Ẩn/hiện thanh menu bên trái (SidebarNavigation) - đặt ở đây (không phải
+  // State cục bộ của MainLayout) vì MainLayout được tạo lại mỗi lần chuyển
+  // route (mỗi GoRoute.builder gọi `MainLayout(child: ...)` mới) - State cục
+  // bộ sẽ mất lựa chọn ẩn/hiện ngay khi operator chuyển màn hình.
+  bool _isSidebarVisible = true;
 
   String get currentView => _currentView;
   List<String> get viewHistory => List.unmodifiable(_viewHistory);
   bool get canGoBack => _viewHistory.length > 1;
+  bool get isSidebarVisible => _isSidebarVisible;
+
+  void toggleSidebar() {
+    _isSidebarVisible = !_isSidebarVisible;
+    notifyListeners();
+  }
 
   void navigateTo(String viewId, {bool addToHistory = true}) {
     if (addToHistory && (viewHistory.isEmpty || viewHistory.last != viewId)) {
@@ -43,6 +54,7 @@ class NavigationProvider extends ChangeNotifier {
       'ng_rate': 'Thống kê > Tỉ lệ phán định',
       'select_lot': 'Thống kê > Chọn lô hàng',
       'defect_type': 'Thống kê > Chi tiết loại lỗi',
+      'ai_agreement': 'Thống kê > Độ khớp AI vs Người',
       'manual_vrs': 'VRS Thủ công',
       'light_adjust': 'VRS Thủ công > Điều chỉnh ánh sáng',
       'board_align_1': 'Định vị > Bước 1/4',

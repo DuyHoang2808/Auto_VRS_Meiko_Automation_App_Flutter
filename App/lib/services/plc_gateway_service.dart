@@ -108,6 +108,11 @@ class PlcGatewayService {
     String? boardId,
     int? defectId,
     String boardSide = 'A',
+    // Ma lo (tbLot.lot_code) + ma board (tbBoard.board_code) hien tai, de
+    // gateway forward sang AI API ghi log/anh theo lo/board. De trong neu
+    // chua co (fallback ve unknown_lot/unknown_board o phia AI API).
+    String lotCode = '',
+    String boardCode = '',
 
     // PLC Configuration
     String plcPcIp = '192.168.3.101',
@@ -131,6 +136,8 @@ class PlcGatewayService {
         boardId: boardId,
         defectId: defectId,
         boardSide: boardSide,
+        lotCode: lotCode,
+        boardCode: boardCode,
         plcPcIp: plcPcIp,
         plcIp: plcIp,
         plcPort: plcPort,
@@ -158,6 +165,8 @@ class PlcGatewayService {
     String? boardId,
     int? defectId,
     String boardSide = 'A',
+    String lotCode = '',
+    String boardCode = '',
     String plcPcIp = '192.168.3.101',
     String plcIp = '192.168.3.1',
     int plcPort = 9600,
@@ -178,6 +187,8 @@ class PlcGatewayService {
         'board_id': boardId,
         'defect_id': defectId,
         'board_side': boardSide,
+        'lot_code': lotCode,
+        'board_code': boardCode,
         'plc_pc_ip': plcPcIp,
         'plc_ip': plcIp,
         'plc_port': plcPort,

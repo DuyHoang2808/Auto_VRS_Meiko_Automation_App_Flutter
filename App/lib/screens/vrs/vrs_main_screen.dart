@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show KeyDownEvent, LogicalKeyboardKey;
 import 'package:autovrs_app/core/feather_icons.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
@@ -11,6 +12,7 @@ import '../../providers/vrs_provider.dart';
 // import '../../services/autovrs_websocket_service.dart';
 import '../../widgets/defect_list_widget.dart';
 import '../../widgets/gerber_image_widget.dart';
+import '../../widgets/last_board_dialog.dart';
 import '../../widgets/stream_source_control.dart';
 import '../../services/local_database_service.dart';
 import '../../services/plc_gateway_service.dart';
@@ -138,10 +140,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     _gerberService = context.read<QCamberGerberService>();
     _newBoardPollTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (!mounted) return;
-      Provider.of<VRSProvider>(
-        context,
-        listen: false,
-      ).checkForNewBoard();
+      Provider.of<VRSProvider>(context, listen: false).checkForNewBoard();
       _refreshOffsetStatus();
     });
     // Màn hình này bị dispose khi điều hướng sang tab khác, nên mỗi lần quay về
@@ -186,7 +185,8 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
 
     final String next;
     if (status['success'] == false) {
-      next = 'unknown'; // gateway không trả lời được, KHÔNG kết luận là chưa calib
+      next =
+          'unknown'; // gateway không trả lời được, KHÔNG kết luận là chưa calib
     } else {
       final data = status['data'];
       final savedId = data is Map ? data['board_id']?.toString() : null;
@@ -313,9 +313,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         // cho board tốt). Trước đây chỉ `return` nên _running kẹt true vĩnh
         // viễn: nút "Bắt đầu" tắt, board không bao giờ completed, và
         // setBusy(true) treo health-check cả session. Phải đóng board tử tế.
-        debugPrint(
-          'VRSMainScreen: board khong co loi nao -> hoan tat board',
-        );
+        debugPrint('VRSMainScreen: board khong co loi nao -> hoan tat board');
         final boardIdForFinish = int.tryParse(vrsProvider.currentBoard);
         setState(() {
           _running = false;
@@ -401,6 +399,11 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         boardId: boardIdRaw?.toString(),
         defectId: defectId,
         boardSide: vrsProvider.currentBoardSide,
+        // Kem lot_code + board_code de BE ghi log/anh truy vet duoc theo
+        // lo/board (luong Auto VRS di qua PlcGatewayService, KHONG qua
+        // AIDetectionService, nen phai gan rieng o day).
+        lotCode: vrsProvider.currentLotCode,
+        boardCode: vrsProvider.currentBoardCode,
       );
 
       if (!mounted || myRunId != _runId) return false;
@@ -460,11 +463,47 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         return false;
       }
 
+      // Verdict THẬT do backend tính (ai_verdict, xem plc_gateway_api.py -
+      // lấy từ statistics.system_verdict: NG nếu có ÍT NHẤT 1 detection với
+      // verdict='NG', KHÔNG PHẢI "có detection nào được trả về"). Trước đây
+      // suy thẳng "có detection = NG" - SAI khi 1 detection được trả về/vẽ
+      // lên ảnh (nghi ngờ ban đầu) nhưng verdict riêng của nó vẫn là 'OK'
+      // (bug thật đã gặp 2026-09-25, cùng lỗi với manual_vrs_screen.dart -
+      // xem AIDetectionResult.systemVerdict). Ở CHẾ ĐỘ AUTO, verdict sai ghi
+      // thẳng vào `judgement` mà KHÔNG qua người xác nhận, nên lỗi này
+      // nghiêm trọng hơn hẳn bên màn thủ công.
+      //
+      // Fallback về suy luận cũ CHỈ khi backend không trả ai_verdict hợp lệ
+      // (null/'UNKNOWN') - để không vỡ hoàn toàn nếu gateway phiên bản cũ
+      // hơn chưa có field này.
+      final verdictUpper = result.aiVerdict?.toUpperCase();
       final hasDetections = result.hasAiResults;
-      final verdict = hasDetections ? 'NG' : 'OK';
-      final detectedType = hasDetections
-          ? (result.aiDetections!.first['class_name']?.toString() ?? 'none')
-          : 'none';
+      final verdict = (verdictUpper == 'OK' || verdictUpper == 'NG')
+          ? verdictUpper!
+          : (hasDetections ? 'NG' : 'OK');
+
+      // Loại lỗi hiển thị/lưu: CHỈ lấy từ detection có verdict THẬT là NG,
+      // không lấy bừa detection đầu tiên trong danh sách (nó có thể tự là OK).
+      final ngDetections = (result.aiDetections ?? [])
+          .whereType<Map>()
+          .where(
+            (d) => (d['verdict']?.toString().toUpperCase() ?? 'NG') == 'NG',
+          )
+          .toList();
+      // Không có detection NG nào trong danh sách trả về KHÔNG có nghĩa là
+      // không biết lỗi gì: gateway chỉ trả TOP-N lỗi theo confidence
+      // (`max_defects_drawn` = 3 trong BE_tensorRT/ai_config.yml) trong khi
+      // verdict tính trên TẤT CẢ lỗi - lỗi gây ra NG hoàn toàn có thể nằm
+      // ngoài TOP-N đó. `statistics.primary_defect` chính là lỗi NG
+      // confidence cao nhất, backend đã tính sẵn (xem
+      // AIDetectionResult.primaryDefectName bên luồng thủ công).
+      final primary = result.aiStatistics?['primary_defect'];
+      final primaryType = primary is Map
+          ? (primary['class_name']?.toString().trim() ?? '')
+          : '';
+      final detectedType = ngDetections.isNotEmpty
+          ? (ngDetections.first['class_name']?.toString() ?? 'none')
+          : (primaryType.isNotEmpty ? primaryType : 'none');
 
       if (defectId != null) {
         debugPrint(
@@ -539,7 +578,8 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       // Nhảy qua các lỗi đã có phán định: VRS thủ công có thể vừa phán định
       // thêm trong lúc chuỗi này đang chờ PLC/AI. Nếu nhảy hết list thì rơi
       // vào nhánh hoàn tất bên dưới (nextIndex >= length), KHÔNG quay về 0.
-      while (nextIndex < reloaded.length && isDefectJudged(reloaded[nextIndex])) {
+      while (nextIndex < reloaded.length &&
+          isDefectJudged(reloaded[nextIndex])) {
         nextIndex++;
       }
 
@@ -610,6 +650,13 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     } catch (e) {
       debugPrint('VRSMainScreen: loi move PLC ve goc sau khi xong board: $e');
     }
+
+    // Board CUỐI CÙNG (hết đợt hoặc hết lô): báo bằng popup, không chỉ dựa vào
+    // banner trong panel bên phải - chế độ Auto chạy một mình nên người vận
+    // hành thường không nhìn màn hình lúc board cuối vừa xong. Tự bỏ qua khi
+    // vẫn còn board kế tiếp.
+    if (!mounted) return;
+    await showLastBoardDialog(context);
   }
 
   /// Tải ảnh thiết kế Gerber (qua QCamber) tại tọa độ của [defect].
@@ -635,7 +682,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       if (coordinates == null) return;
 
       await _gerberService.captureGerberImage(
-        modelName: model['name'] ?? 'Model_${model['id_model']}',
+        modelName: QCamberGerberService.resolveJobName(model),
         coordinates: coordinates,
         // Chỉ đi vào metadata hiển thị của QCamberGerberService (payload gửi
         // QCamber không có field này), nên dùng luôn tên để đọc log dễ hơn.
@@ -790,8 +837,15 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
   }
 
   /// Hiện dialog kết quả calib thành công, chờ operator xác nhận tiếp tục.
-  /// Trả `true` nếu bấm "Tiếp tục", `false` nếu bấm "Hủy".
-  Future<bool> _showCalibSuccessDialog(AutoBoardOffsetResponse result) async {
+  /// Nếu có cảnh báo (RMS vượt ngưỡng an toàn), cho phép bấm "Calib lại" ngay
+  /// tại đây thay vì phải tự tìm nút calib ở chỗ khác - calib lại xong sẽ hiện
+  /// lại chính dialog này với kết quả mới, lặp tới khi operator Hủy/Tiếp tục.
+  /// Trả `true` nếu bấm "Tiếp tục", `false` nếu bấm "Hủy" (hoặc calib lại thất bại).
+  Future<bool> _showCalibSuccessDialog(
+    AutoBoardOffsetResponse result, {
+    required String boardSide,
+    required String boardId,
+  }) async {
     final hasWarning = result.warning != null;
     final action = await showDialog<String>(
       context: context,
@@ -804,9 +858,11 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
               color: hasWarning ? Colors.orange : Colors.green,
             ),
             const SizedBox(width: 8),
-            Text(hasWarning
-                ? 'Calib thành công (có cảnh báo)'
-                : 'Calib bù lệch thành công'),
+            Text(
+              hasWarning
+                  ? 'Calib thành công (có cảnh báo)'
+                  : 'Calib bù lệch thành công',
+            ),
           ],
         ),
         content: Column(
@@ -831,6 +887,11 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
             onPressed: () => Navigator.pop(ctx, 'cancel'),
             child: const Text('Hủy'),
           ),
+          if (hasWarning)
+            OutlinedButton(
+              onPressed: () => Navigator.pop(ctx, 'recalib'),
+              child: const Text('Calib lại'),
+            ),
           ElevatedButton(
             onPressed: () => Navigator.pop(ctx, 'continue'),
             style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
@@ -839,6 +900,41 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         ],
       ),
     );
+
+    if (action == 'recalib') {
+      if (!mounted) return false;
+      setState(() => _calibrating = true);
+      final retryResult = await _plcGateway.triggerAutoBoardOffset(
+        boardSide: boardSide,
+        boardId: boardId.isNotEmpty ? boardId : null,
+      );
+      if (!mounted) return false;
+      setState(() => _calibrating = false);
+
+      if (retryResult.success) {
+        Provider.of<VRSProvider>(
+          context,
+          listen: false,
+        ).markCalibrated(boardId: boardId, side: boardSide);
+        _refreshOffsetStatus();
+        return _showCalibSuccessDialog(
+          retryResult,
+          boardSide: boardSide,
+          boardId: boardId,
+        );
+      }
+      if (mounted) {
+        scaffoldMessengerKey.currentState?.showSnackBar(
+          SnackBar(
+            content: Text('Calib lại thất bại: ${retryResult.message}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+      return false;
+    }
+
     return action == 'continue';
   }
 
@@ -893,37 +989,57 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         'tx=${result.tx?.toStringAsFixed(4)} ty=${result.ty?.toStringAsFixed(4)} '
         'RMS=${result.rmsErrorMm?.toStringAsFixed(4)}mm',
       );
-      vrs.markCalibrated(boardId: targetBoardId, side: targetSide);
+      vrs.markCalibrated(
+        boardId: targetBoardId,
+        side: targetSide,
+        boardCode: vrs.nextBoardCode,
+      );
       if (!mounted) return false;
       _refreshOffsetStatus();
       // Hiện kết quả calib, chờ operator xác nhận
-      return await _showCalibSuccessDialog(result);
+      return await _showCalibSuccessDialog(
+        result,
+        boardSide: targetSide,
+        boardId: targetBoardId,
+      );
     }
 
     // Calib thất bại → dialog cho user chọn
     final action = await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Calib bù lệch thất bại'),
-        content: Text(
-          '${result.message}\n\n'
-          'Thử lại, bỏ qua (dùng tọa độ gốc không bù), hoặc hủy?',
+      builder: (ctx) => CallbackShortcuts(
+        // Chỉ bắt riêng Esc để trả 'cancel' rõ ràng; ←/→/Enter CỐ TÌNH không
+        // tự viết tay mà để Flutter tự xử lý mặc định: ←/→ di chuyển focus
+        // giữa 3 nút (Material Button đã hỗ trợ sẵn), Enter kích hoạt đúng
+        // nút đang được chọn (focus) - y hệt click chuột vào nút đó.
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.escape): () =>
+              Navigator.pop(ctx, 'cancel'),
+        },
+        child: AlertDialog(
+          title: const Text('Calib bù lệch thất bại'),
+          content: Text(
+            '${result.message}\n\n'
+            'Thử lại, bỏ qua (dùng tọa độ gốc không bù), hoặc hủy?\n'
+            '(←/→ chọn · Enter xác nhận · Esc hủy)',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'cancel'),
+              child: const Text('Hủy'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'skip'),
+              child: const Text('Bỏ qua'),
+            ),
+            ElevatedButton(
+              autofocus: true,
+              onPressed: () => Navigator.pop(ctx, 'retry'),
+              child: const Text('Thử lại'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, 'cancel'),
-            child: const Text('Hủy'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, 'skip'),
-            child: const Text('Bỏ qua'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, 'retry'),
-            child: const Text('Thử lại'),
-          ),
-        ],
       ),
     );
 
@@ -1140,9 +1256,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         if (!mounted) return;
         Provider.of<VRSProvider>(context, listen: false).setCurrentBoardMeta(
           code: boardRow?['board_code']?.toString() ?? '',
-          side: VRSProvider.boardSideFromLayerId(
-            boardRow?['layer_id']?.toString(),
-          ),
+          side: VRSProvider.boardSideOf(boardRow),
         );
         final myRunId = _runId; // đã bump ở wrapper
         setState(() {
@@ -1161,11 +1275,10 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       if (!mounted) return;
     }
 
-    // Đọc board row để xác định layer_id → board side
+    // Đọc board row để xác định board side
     final boardRow = await db.getBoardById(boardId);
     if (!mounted) return;
-    final layerId = boardRow?['layer_id']?.toString();
-    final side = VRSProvider.boardSideFromLayerId(layerId);
+    final side = VRSProvider.boardSideOf(boardRow);
 
     // Đồng bộ currentBoardSide/currentBoardCode trên provider NGAY (không
     // đợi advanceToNextBoard) - Manual VRS screen đọc currentBoardSide để
@@ -1182,10 +1295,18 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     // provider (sống qua điều hướng), NHƯNG phải xác minh với gateway trước khi
     // tin: nếu file offset đã mất mà vẫn bỏ qua calib thì gateway sẽ lặng lẽ
     // soi cả board bằng toạ độ chưa bù.
-    if (vrs.isCalibratedFor(boardId: boardId.toString(), side: side)) {
+    // Chấp nhận cả calib của CÙNG BO VẬT LÝ cùng mặt (dòng tbBoard khác của
+    // chính bo đang gá) - bo không rời bàn máy thì offset vẫn đúng, bắt calib
+    // lại mỗi dòng layer là thêm 90s mà không được gì (xem
+    // VRSProvider.isCalibratedForPhysical). Vẫn hỏi operator qua
+    // _showAlreadyCalibratedDialog chứ không tự bỏ qua.
+    final boardCode = boardRow?['board_code']?.toString() ?? '';
+    if (vrs.isCalibratedFor(boardId: boardId.toString(), side: side) ||
+        vrs.isCalibratedForPhysical(boardCode: boardCode, side: side)) {
+      // Hỏi gateway theo id_board ĐÃ ghi vào file offset, không phải id đang mở.
       final offsetStillValid = await _plcGateway.hasValidOffsetFor(
         boardSide: side,
-        boardId: boardId.toString(),
+        boardId: vrs.calibratedBoardId,
       );
       if (!mounted) return;
       if (offsetStillValid) {
@@ -1221,11 +1342,19 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
         'tx=${result.tx?.toStringAsFixed(4)} ty=${result.ty?.toStringAsFixed(4)} '
         'RMS=${result.rmsErrorMm?.toStringAsFixed(4)}mm',
       );
-      vrs.markCalibrated(boardId: boardId.toString(), side: side);
+      vrs.markCalibrated(
+        boardId: boardId.toString(),
+        side: side,
+        boardCode: boardCode,
+      );
       if (!mounted) return;
       _refreshOffsetStatus();
       // Hiện kết quả calib, chờ operator xác nhận trước khi chạy workflow
-      final proceed = await _showCalibSuccessDialog(result);
+      final proceed = await _showCalibSuccessDialog(
+        result,
+        boardSide: side,
+        boardId: boardId.toString(),
+      );
       if (proceed && mounted) {
         await _startWorkflow(boardId);
       }
@@ -1236,26 +1365,38 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     final action = await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Calib bù lệch thất bại'),
-        content: Text(
-          '${result.message}\n\n'
-          'Thử lại, bỏ qua (dùng tọa độ gốc không bù), hoặc hủy?',
+      builder: (ctx) => CallbackShortcuts(
+        // Chỉ bắt riêng Esc để trả 'cancel' rõ ràng; ←/→/Enter CỐ TÌNH không
+        // tự viết tay mà để Flutter tự xử lý mặc định: ←/→ di chuyển focus
+        // giữa 3 nút (Material Button đã hỗ trợ sẵn), Enter kích hoạt đúng
+        // nút đang được chọn (focus) - y hệt click chuột vào nút đó.
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.escape): () =>
+              Navigator.pop(ctx, 'cancel'),
+        },
+        child: AlertDialog(
+          title: const Text('Calib bù lệch thất bại'),
+          content: Text(
+            '${result.message}\n\n'
+            'Thử lại, bỏ qua (dùng tọa độ gốc không bù), hoặc hủy?\n'
+            '(←/→ chọn · Enter xác nhận · Esc hủy)',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'cancel'),
+              child: const Text('Hủy'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'skip'),
+              child: const Text('Bỏ qua'),
+            ),
+            ElevatedButton(
+              autofocus: true,
+              onPressed: () => Navigator.pop(ctx, 'retry'),
+              child: const Text('Thử lại'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, 'cancel'),
-            child: const Text('Hủy'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, 'skip'),
-            child: const Text('Bỏ qua'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, 'retry'),
-            child: const Text('Thử lại'),
-          ),
-        ],
       ),
     );
 
@@ -1372,10 +1513,12 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
       return const SizedBox.shrink();
     }
     final side = vrs.currentBoardSide;
-    final sideLabel = 'mặt $side${side == "A" ? " - Top" : " - Bot"}';
+    final sideLabel = 'mặt $side${side == "B" ? " - Top" : " - Bot"}';
     final claimed = vrs.isCalibratedFor(boardId: boardText, side: side);
     // Chỉ dùng kết quả xác minh nếu nó thuộc đúng board+mặt đang hiển thị.
-    final checked = _offsetStatusKey == '$boardText|$side' ? _offsetStatus : 'none';
+    final checked = _offsetStatusKey == '$boardText|$side'
+        ? _offsetStatus
+        : 'none';
 
     final Color color;
     final IconData icon;
@@ -1387,12 +1530,14 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
     } else if (checked == 'valid') {
       color = Colors.green;
       icon = Icons.check_circle_outline;
-      text = 'Đã calib bù lệch $sideLabel — gateway còn dữ liệu, sẽ bỏ qua '
+      text =
+          'Đã calib bù lệch $sideLabel — gateway còn dữ liệu, sẽ bỏ qua '
           'bước calib.';
     } else if (checked == 'invalid') {
       color = Colors.red;
       icon = Icons.error_outline;
-      text = 'Đã calib $sideLabel trong phiên này nhưng gateway KHÔNG còn dữ '
+      text =
+          'Đã calib $sideLabel trong phiên này nhưng gateway KHÔNG còn dữ '
           'liệu bù lệch đúng của board này — sẽ phải calib lại.';
     } else {
       color = Colors.blue;
@@ -1415,10 +1560,7 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
             Icon(icon, size: 16, color: color),
             const SizedBox(width: 8),
             Expanded(
-              child: Text(
-                text,
-                style: TextStyle(fontSize: 12, color: color),
-              ),
+              child: Text(text, style: TextStyle(fontSize: 12, color: color)),
             ),
           ],
         ),
@@ -1428,814 +1570,995 @@ class _VRSMainScreenState extends State<VRSMainScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final screenWidth = MediaQuery.of(context).size.width;
-        final isSmallScreen = screenWidth < 1200;
-        final padding = isSmallScreen ? 16.0 : 24.0;
+    // Phím tắt cho OP: Space bật/tắt quy trình Auto (giống bấm "Bắt đầu"/
+    // "Dừng"). Xem `_handleKeyEvent` để biết điều kiện bật/tắt.
+    return Focus(
+      autofocus: true,
+      onKeyEvent: _handleKeyEvent,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final screenWidth = MediaQuery.of(context).size.width;
+          final isSmallScreen = screenWidth < 1200;
+          final padding = isSmallScreen ? 16.0 : 24.0;
 
-        // read providers early in the builder so UI below can use dynamic values
-        final vrsProvider = Provider.of<VRSProvider>(context);
+          // read providers early in the builder so UI below can use dynamic values
+          final vrsProvider = Provider.of<VRSProvider>(context);
 
-        // compute display values
-        final lotText =
-            (vrsProvider.currentLotCode.isNotEmpty &&
-                vrsProvider.currentLotCode != 'Chưa có')
-            ? vrsProvider.currentLotCode
-            : 'Chưa có';
-        final boardText =
-            (vrsProvider.currentBoard.isNotEmpty &&
-                vrsProvider.currentBoard != 'Chưa có')
-            ? vrsProvider.currentBoard
-            : 'Chưa có';
+          // compute display values
+          final lotText =
+              (vrsProvider.currentLotCode.isNotEmpty &&
+                  vrsProvider.currentLotCode != 'Chưa có')
+              ? vrsProvider.currentLotCode
+              : 'Chưa có';
+          final boardText =
+              (vrsProvider.currentBoard.isNotEmpty &&
+                  vrsProvider.currentBoard != 'Chưa có')
+              ? vrsProvider.currentBoard
+              : 'Chưa có';
 
-        // "Loại lỗi AI dự đoán": lấy từ phán định ĐÃ LƯU của board này.
-        //
-        // Trước đây lấy từ AutoVRSWebSocketService.lastDetectionResults /
-        // lastAnalysis. Service đó app-scoped, mà ở chế độ tự động nó KHÔNG BAO
-        // GIỜ được ghi (auto đi qua /api/inspect-defect của gateway, không qua
-        // websocket capture) - nên giá trị duy nhất có thể có là kết quả do màn
-        // VRS thủ công chụp, tức tab Auto hiện loại lỗi của board KHÁC. Kèm theo
-        // đó là ~10 dòng debugPrint chạy MỖI lần build.
-        final latestVerdict = _latestVerdict();
-        final String aiText;
-        if (latestVerdict.verdict == null) {
-          aiText = 'Chưa có';
-        } else if (latestVerdict.verdict!.toUpperCase() == 'OK') {
-          aiText = 'Không phát hiện lỗi';
-        } else if (latestVerdict.type != null &&
-            latestVerdict.type!.isNotEmpty &&
-            latestVerdict.type != 'none') {
-          aiText = _getDefectDisplayName(latestVerdict.type!);
-        } else {
-          aiText = 'Có lỗi';
-        }
+          // "Loại lỗi AI dự đoán": lấy từ phán định ĐÃ LƯU của board này.
+          //
+          // Trước đây lấy từ AutoVRSWebSocketService.lastDetectionResults /
+          // lastAnalysis. Service đó app-scoped, mà ở chế độ tự động nó KHÔNG BAO
+          // GIỜ được ghi (auto đi qua /api/inspect-defect của gateway, không qua
+          // websocket capture) - nên giá trị duy nhất có thể có là kết quả do màn
+          // VRS thủ công chụp, tức tab Auto hiện loại lỗi của board KHÁC. Kèm theo
+          // đó là ~10 dòng debugPrint chạy MỖI lần build.
+          final latestVerdict = _latestVerdict();
+          final String aiText;
+          if (latestVerdict.verdict == null) {
+            aiText = 'Chưa có';
+          } else if (latestVerdict.verdict!.toUpperCase() == 'OK') {
+            aiText = 'Không phát hiện lỗi';
+          } else if (latestVerdict.type != null &&
+              latestVerdict.type!.isNotEmpty &&
+              latestVerdict.type != 'none') {
+            aiText = _getDefectDisplayName(latestVerdict.type!);
+          } else {
+            aiText = 'Có lỗi';
+          }
 
-        return Padding(
-          padding: EdgeInsets.all(padding),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Image Display Panel
-              Expanded(
-                flex: 3,
-                child: Row(
-                  children: [
-                    // Main VRS Image - Left side
-                    Expanded(
-                      flex: 2, // Increased from 1 to 2 for wider camera view
-                      child: Card(
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text(
-                                'Ảnh Live từ VRS',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w600,
+          return Padding(
+            // Khung ảnh live là HÌNH VUÔNG (squareSize = min(width, height) -
+            // xem LayoutBuilder bên dưới), và ở hầu hết kích thước màn hình
+            // chiều CAO mới là chiều giới hạn (chiều rộng luôn dư ra) - nên
+            // padding dọc tốn bao nhiêu là ô vuông nhỏ lại bấy nhiêu, trong
+            // khi padding ngang gần như không ảnh hưởng. Giảm padding dọc
+            // xuống 1 nửa so với ngang để nhường không gian cho ô vuông.
+            padding: EdgeInsets.symmetric(
+              horizontal: padding,
+              vertical: padding / 2,
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Image Display Panel
+                Expanded(
+                  flex: 3,
+                  child: Row(
+                    children: [
+                      // Main VRS Image - Left side
+                      Expanded(
+                        flex: 2, // Increased from 1 to 2 for wider camera view
+                        child: Card(
+                          child: Padding(
+                            // Cùng lý do như Padding ngoài: giảm padding dọc
+                            // của Card để nhường thêm chiều cao cho ô vuông.
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 8,
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                // Gộp tiêu đề + các nút điều khiển nguồn video
+                                // lên chung 1 dòng (Wrap tự xuống dòng khi
+                                // hẹp), nằm sát nhau bên cạnh nhau thay vì
+                                // dạt ra 2 mép Card - đồng bộ với
+                                // manual_vrs_screen.dart. Alignment.start
+                                // (không phải spaceBetween) vì Card này có
+                                // thể rất rộng, spaceBetween sẽ kéo tiêu đề
+                                // và cụm nút cách xa nhau quá mức.
+                                Wrap(
+                                  alignment: WrapAlignment.start,
+                                  crossAxisAlignment: WrapCrossAlignment.center,
+                                  spacing: 16,
+                                  runSpacing: 8,
+                                  children: const [
+                                    Text(
+                                      'Ảnh Live từ VRS',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                    StreamSourceControl(),
+                                  ],
                                 ),
-                              ),
-                              const SizedBox(height: 8),
-                              const StreamSourceControl(),
-                              const SizedBox(height: 12),
-                              Expanded(
-                                child: LayoutBuilder(
-                                  builder: (context, constraints) {
-                                    // Calculate square size based on available space
-                                    final availableWidth = constraints.maxWidth;
-                                    final availableHeight =
-                                        constraints.maxHeight;
-                                    final squareSize =
-                                        availableWidth < availableHeight
-                                        ? availableWidth
-                                        : availableHeight;
-                                    // Kích thước DECODE của frame preview.
-                                    // `width`/`height` của Image chỉ là kích
-                                    // thước vẽ - không có cacheHeight thì mỗi
-                                    // frame vẫn được decode ở nguyên độ phân
-                                    // giải nguồn (1080p = 8,3 MB bitmap), 15
-                                    // lần/giây, để rồi vẽ vào ô vài trăm px.
-                                    // Chỉ đặt cacheHeight (không đặt cả hai):
-                                    // dart:ui giữ đúng tỉ lệ khi chỉ có một
-                                    // chiều, còn đặt cả hai sẽ bóp méo ảnh.
-                                    // Với BoxFit.cover vào ô vuông thì chiều
-                                    // cao là chiều quyết định.
-                                    final previewDecodeHeight =
-                                        squareSize.isFinite && squareSize > 0
-                                        ? squareSize.round()
-                                        : null;
+                                const SizedBox(height: 16),
+                                Expanded(
+                                  child: LayoutBuilder(
+                                    builder: (context, constraints) {
+                                      // Calculate square size based on available space
+                                      final availableWidth =
+                                          constraints.maxWidth;
+                                      final availableHeight =
+                                          constraints.maxHeight;
+                                      final squareSize =
+                                          availableWidth < availableHeight
+                                          ? availableWidth
+                                          : availableHeight;
+                                      // Kích thước DECODE của frame preview.
+                                      // `width`/`height` của Image chỉ là kích
+                                      // thước vẽ - không có cacheHeight thì mỗi
+                                      // frame vẫn được decode ở nguyên độ phân
+                                      // giải nguồn (1080p = 8,3 MB bitmap), 15
+                                      // lần/giây, để rồi vẽ vào ô vài trăm px.
+                                      // Chỉ đặt cacheHeight (không đặt cả hai):
+                                      // dart:ui giữ đúng tỉ lệ khi chỉ có một
+                                      // chiều, còn đặt cả hai sẽ bóp méo ảnh.
+                                      // Với BoxFit.cover vào ô vuông thì chiều
+                                      // cao là chiều quyết định.
+                                      final previewDecodeHeight =
+                                          squareSize.isFinite && squareSize > 0
+                                          ? squareSize.round()
+                                          : null;
 
-                                    return Center(
-                                      child: SizedBox(
-                                        width: squareSize,
-                                        height: squareSize,
-                                        child: Container(
-                                          decoration: BoxDecoration(
-                                            color: Colors.black,
-                                            borderRadius: BorderRadius.circular(
-                                              8,
+                                      return Center(
+                                        child: SizedBox(
+                                          width: squareSize,
+                                          height: squareSize,
+                                          child: Container(
+                                            decoration: BoxDecoration(
+                                              color: Colors.black,
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                            ),
+                                            child: ValueListenableBuilder<Uint8List?>(
+                                              valueListenable:
+                                                  Provider.of<
+                                                        AutoVRSWebSocketService
+                                                      >(context, listen: false)
+                                                      .currentFrameNotifier,
+                                              builder: (context, frameData, child) {
+                                                final webSocketService =
+                                                    Provider.of<
+                                                      AutoVRSWebSocketService
+                                                    >(context, listen: false);
+
+                                                if (webSocketService
+                                                        .displayImage !=
+                                                    null) {
+                                                  // Backend đã vẽ bounding boxes vào ảnh rồi, chỉ cần hiển thị
+                                                  return ClipRRect(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                    child: Image.memory(
+                                                      webSocketService
+                                                          .displayImage!,
+                                                      fit: BoxFit.cover,
+                                                      width: squareSize,
+                                                      height: squareSize,
+                                                      cacheHeight:
+                                                          previewDecodeHeight,
+                                                      gaplessPlayback:
+                                                          true, // Optimize for smooth video playback
+                                                    ),
+                                                  );
+                                                } else if (frameData != null) {
+                                                  return ClipRRect(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          8,
+                                                        ),
+                                                    child: Image.memory(
+                                                      frameData,
+                                                      fit: BoxFit.cover,
+                                                      width: squareSize,
+                                                      height: squareSize,
+                                                      cacheHeight:
+                                                          previewDecodeHeight,
+                                                      gaplessPlayback:
+                                                          true, // Optimize for smooth video playback
+                                                    ),
+                                                  );
+                                                } else if (webSocketService
+                                                    .isConnected) {
+                                                  return const Center(
+                                                    child: Column(
+                                                      mainAxisAlignment:
+                                                          MainAxisAlignment
+                                                              .center,
+                                                      children: [
+                                                        CircularProgressIndicator(
+                                                          color: Colors.white,
+                                                        ),
+                                                        SizedBox(height: 8),
+                                                        Text(
+                                                          'Đang khởi tạo camera...',
+                                                          style: TextStyle(
+                                                            color: Colors.white,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  );
+                                                } else {
+                                                  return const Center(
+                                                    child: Column(
+                                                      mainAxisAlignment:
+                                                          MainAxisAlignment
+                                                              .center,
+                                                      children: [
+                                                        Icon(
+                                                          Icons.wifi_off,
+                                                          color: Colors.red,
+                                                          size: 48,
+                                                        ),
+                                                        SizedBox(height: 8),
+                                                        Text(
+                                                          'AutoVRS Disconnected',
+                                                          style: TextStyle(
+                                                            color: Colors.white,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  );
+                                                }
+                                              },
                                             ),
                                           ),
-                                          child: ValueListenableBuilder<Uint8List?>(
-                                            valueListenable:
-                                                Provider.of<
-                                                      AutoVRSWebSocketService
-                                                    >(context, listen: false)
-                                                    .currentFrameNotifier,
-                                            builder: (context, frameData, child) {
-                                              final webSocketService =
-                                                  Provider.of<
-                                                    AutoVRSWebSocketService
-                                                  >(context, listen: false);
-
-                                              if (webSocketService
-                                                      .displayImage !=
-                                                  null) {
-                                                // Backend đã vẽ bounding boxes vào ảnh rồi, chỉ cần hiển thị
-                                                return ClipRRect(
-                                                  borderRadius:
-                                                      BorderRadius.circular(8),
-                                                  child: Image.memory(
-                                                    webSocketService
-                                                        .displayImage!,
-                                                    fit: BoxFit.cover,
-                                                    width: squareSize,
-                                                    height: squareSize,
-                                                    cacheHeight:
-                                                        previewDecodeHeight,
-                                                    gaplessPlayback:
-                                                        true, // Optimize for smooth video playback
-                                                  ),
-                                                );
-                                              } else if (frameData != null) {
-                                                return ClipRRect(
-                                                  borderRadius:
-                                                      BorderRadius.circular(8),
-                                                  child: Image.memory(
-                                                    frameData,
-                                                    fit: BoxFit.cover,
-                                                    width: squareSize,
-                                                    height: squareSize,
-                                                    cacheHeight:
-                                                        previewDecodeHeight,
-                                                    gaplessPlayback:
-                                                        true, // Optimize for smooth video playback
-                                                  ),
-                                                );
-                                              } else if (webSocketService
-                                                  .isConnected) {
-                                                return const Center(
-                                                  child: Column(
-                                                    mainAxisAlignment:
-                                                        MainAxisAlignment
-                                                            .center,
-                                                    children: [
-                                                      CircularProgressIndicator(
-                                                        color: Colors.white,
-                                                      ),
-                                                      SizedBox(height: 8),
-                                                      Text(
-                                                        'Đang khởi tạo camera...',
-                                                        style: TextStyle(
-                                                          color: Colors.white,
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                );
-                                              } else {
-                                                return const Center(
-                                                  child: Column(
-                                                    mainAxisAlignment:
-                                                        MainAxisAlignment
-                                                            .center,
-                                                    children: [
-                                                      Icon(
-                                                        Icons.wifi_off,
-                                                        color: Colors.red,
-                                                        size: 48,
-                                                      ),
-                                                      SizedBox(height: 8),
-                                                      Text(
-                                                        'AutoVRS Disconnected',
-                                                        style: TextStyle(
-                                                          color: Colors.white,
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                );
-                                              }
-                                            },
-                                          ),
                                         ),
-                                      ),
-                                    );
-                                  },
+                                      );
+                                    },
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ),
                       ),
-                    ),
 
-                    const SizedBox(width: 16),
+                      const SizedBox(width: 16),
 
-                    // Comparison Images - Right side (stacked)
-                    Expanded(
-                      flex: 1,
-                      child: Column(
-                        children: [
-                          // Gerber View
-                          Expanded(
-                            child: Card(
-                              child: Padding(
-                                padding: const EdgeInsets.all(12),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Ảnh từ Thiết kế Gerber',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
+                      // Comparison Images - Right side (stacked)
+                      Expanded(
+                        flex: 1,
+                        child: Column(
+                          children: [
+                            // Gerber View
+                            Expanded(
+                              child: Card(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        'Ảnh từ Thiết kế Gerber',
+                                        style: TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.w600,
+                                        ),
                                       ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Expanded(
-                                      child: GerberImageWidget(
-                                        isLoading: _isLoadingGerber,
-                                        errorMessage: _gerberService.lastError,
+                                      const SizedBox(height: 8),
+                                      Expanded(
+                                        child: GerberImageWidget(
+                                          isLoading: _isLoadingGerber,
+                                          errorMessage:
+                                              _gerberService.lastError,
+                                        ),
                                       ),
-                                    ),
-                                  ],
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
 
-                          const SizedBox(height: 16),
+                            const SizedBox(height: 16),
 
-                          // AOI Capture
-                          Expanded(
-                            child: Card(
-                              child: Padding(
-                                padding: const EdgeInsets.all(12),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const Text(
-                                      'Ảnh từ PCI AOI',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
+                            // AOI Capture
+                            Expanded(
+                              child: Card(
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        'Ảnh từ PCI AOI',
+                                        style: TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.w600,
+                                        ),
                                       ),
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Expanded(
-                                      child: LayoutBuilder(
-                                        builder: (context, constraints) {
-                                          final availableWidth =
-                                              constraints.maxWidth;
-                                          final availableHeight =
-                                              constraints.maxHeight;
-                                          final squareSize =
-                                              availableWidth < availableHeight
-                                              ? availableWidth
-                                              : availableHeight;
+                                      const SizedBox(height: 8),
+                                      Expanded(
+                                        child: LayoutBuilder(
+                                          builder: (context, constraints) {
+                                            final availableWidth =
+                                                constraints.maxWidth;
+                                            final availableHeight =
+                                                constraints.maxHeight;
+                                            final squareSize =
+                                                availableWidth < availableHeight
+                                                ? availableWidth
+                                                : availableHeight;
 
-                                          return Center(
-                                            child: SizedBox(
-                                              width: squareSize,
-                                              height: squareSize,
-                                              child: Container(
-                                                decoration: BoxDecoration(
-                                                  color: Colors.grey.shade200,
-                                                  borderRadius:
-                                                      BorderRadius.circular(6),
-                                                ),
-                                                child: ClipRRect(
-                                                  borderRadius:
-                                                      BorderRadius.circular(6),
-                                                  child:
-                                                      _lastCapturedImageBytes !=
-                                                          null
-                                                      ? Image.memory(
-                                                          _lastCapturedImageBytes!,
-                                                          fit: BoxFit.contain,
-                                                          errorBuilder:
-                                                              (
-                                                                context,
-                                                                error,
-                                                                stackTrace,
-                                                              ) => const Center(
-                                                                child: Text(
-                                                                  'Không thể hiển thị ảnh',
-                                                                  style: TextStyle(
-                                                                    color: Colors
-                                                                        .black,
-                                                                    fontSize:
-                                                                        12,
+                                            return Center(
+                                              child: SizedBox(
+                                                width: squareSize,
+                                                height: squareSize,
+                                                child: Container(
+                                                  decoration: BoxDecoration(
+                                                    color: Colors.grey.shade200,
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          6,
+                                                        ),
+                                                  ),
+                                                  child: ClipRRect(
+                                                    borderRadius:
+                                                        BorderRadius.circular(
+                                                          6,
+                                                        ),
+                                                    child:
+                                                        _lastCapturedImageBytes !=
+                                                            null
+                                                        ? Image.memory(
+                                                            _lastCapturedImageBytes!,
+                                                            fit: BoxFit.contain,
+                                                            errorBuilder:
+                                                                (
+                                                                  context,
+                                                                  error,
+                                                                  stackTrace,
+                                                                ) => const Center(
+                                                                  child: Text(
+                                                                    'Không thể hiển thị ảnh',
+                                                                    style: TextStyle(
+                                                                      color: Colors
+                                                                          .black,
+                                                                      fontSize:
+                                                                          12,
+                                                                    ),
                                                                   ),
                                                                 ),
+                                                          )
+                                                        : const Center(
+                                                            child: Text(
+                                                              'AOI Capture',
+                                                              style: TextStyle(
+                                                                color: Colors
+                                                                    .black,
+                                                                fontSize: 12,
                                                               ),
-                                                        )
-                                                      : const Center(
-                                                          child: Text(
-                                                            'AOI Capture',
-                                                            style: TextStyle(
-                                                              color: Colors
-                                                                  .black,
-                                                              fontSize: 12,
                                                             ),
                                                           ),
-                                                        ),
+                                                  ),
                                                 ),
                                               ),
-                                            ),
-                                          );
-                                        },
+                                            );
+                                          },
+                                        ),
                                       ),
-                                    ),
-                                  ],
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(width: 24),
-
-              // Info & Action Panel
-              SizedBox(
-                width: isSmallScreen ? 280 : 320,
-                child: Card(
-                  shape: RoundedRectangleBorder(
-                    side: BorderSide(color: Colors.grey.shade300, width: 1),
-                    borderRadius: BorderRadius.circular(8),
+                    ],
                   ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(20),
-                    child: SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Giám sát VRS Auto',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w600,
+                ),
+
+                const SizedBox(width: 24),
+
+                // Info & Action Panel
+                SizedBox(
+                  width: isSmallScreen ? 280 : 320,
+                  child: Card(
+                    shape: RoundedRectangleBorder(
+                      side: BorderSide(color: Colors.grey.shade300, width: 1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Giám sát VRS Auto',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
-                          ),
 
-                          const Divider(height: 24),
+                            const Divider(height: 24),
 
-                          // Info rows (dynamic from providers)
-                          _buildInfoRow('Mã Lô:', lotText),
-                          const SizedBox(height: 12),
-                          _buildInfoRow('Số thứ tự bo:', boardText),
-                          const SizedBox(height: 12),
-                          _buildInfoRow(
-                            'Tên board (AOI):',
-                            vrsProvider.currentBoardCode.isNotEmpty
-                                ? vrsProvider.currentBoardCode
-                                : 'Chưa có',
-                          ),
-                          const SizedBox(height: 12),
-                          _buildInfoRow(
-                            'Mặt board:',
-                            boardText != 'Chưa có'
-                                ? '${vrsProvider.currentBoardSide}'
-                                      '${vrsProvider.currentBoardSide == "A" ? " (Top)" : " (Bot)"}'
-                                : 'Chưa có',
-                          ),
-                          const SizedBox(height: 12),
-                          _buildInfoRow('Loại lỗi AI dự đoán:', aiText),
-                          const SizedBox(height: 12),
-                          // Total defects for current board
-                          FutureBuilder<List<Map<String, dynamic>>>(
-                            future: (int.tryParse(boardText) != null)
-                                ? LocalDatabaseService().getDefectsByBoard(
-                                    int.parse(boardText),
-                                  )
-                                : Future.value([]),
-                            builder: (context, snap) {
-                              final total = snap.hasData
-                                  ? snap.data!.length
-                                  : 0;
-                              return _buildInfoRow(
-                                'Số lỗi trên bo:',
-                                total.toString(),
-                              );
-                            },
-                          ),
+                            // Info rows (dynamic from providers)
+                            _buildInfoRow('Mã Lô:', lotText),
+                            const SizedBox(height: 12),
+                            // Hiện board_code (mã board AOI, có ý nghĩa với
+                            // vận hành viên) - KHÔNG hiện `boardText`
+                            // (id_board, khoá DB nội bộ) trực tiếp ở đây nữa.
+                            // `boardText` vẫn giữ nguyên id_board cho mọi
+                            // logic khác bên dưới (truy vấn DB, calib...),
+                            // chỉ đổi đúng dòng HIỂN THỊ này. Gộp luôn với
+                            // dòng "Tên board (AOI)" cũ - 2 dòng đó giờ trùng
+                            // nhau hoàn toàn.
+                            _buildInfoRow(
+                              'Số thứ tự bo:',
+                              vrsProvider.currentBoardCode.isNotEmpty
+                                  ? vrsProvider.currentBoardCode
+                                  : 'Chưa có',
+                            ),
+                            const SizedBox(height: 12),
+                            _buildInfoRow(
+                              'Mặt board:',
+                              boardText != 'Chưa có'
+                                  ? '${vrsProvider.currentBoardSide}'
+                                        '${vrsProvider.currentBoardSide == "B" ? " (Top)" : " (Bot)"}'
+                                  : 'Chưa có',
+                            ),
+                            const SizedBox(height: 12),
+                            _buildInfoRow('Loại lỗi AI dự đoán:', aiText),
+                            const SizedBox(height: 12),
+                            // Total defects for current board
+                            FutureBuilder<List<Map<String, dynamic>>>(
+                              future: (int.tryParse(boardText) != null)
+                                  ? LocalDatabaseService().getDefectsByBoard(
+                                      int.parse(boardText),
+                                    )
+                                  : Future.value([]),
+                              builder: (context, snap) {
+                                final total = snap.hasData
+                                    ? snap.data!.length
+                                    : 0;
+                                return _buildInfoRow(
+                                  'Số lỗi trên bo:',
+                                  total.toString(),
+                                );
+                              },
+                            ),
 
-                          const SizedBox(height: 24),
+                            const SizedBox(height: 24),
 
-                          // AI Result
-                          const Text(
-                            'Kết quả phán định AI',
-                            style: TextStyle(fontSize: 14, color: Colors.grey),
-                            textAlign: TextAlign.center,
-                          ),
+                            // AI Result
+                            const Text(
+                              'Kết quả phán định AI',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: Colors.grey,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
 
-                          const SizedBox(height: 12),
+                            const SizedBox(height: 12),
 
-                          // Dynamic AI Result Panel - shows OK (green) or NG (red)
-                          Builder(
-                            builder: (context) {
-                              // Nguồn dữ liệu cho panel, theo thứ tự ưu tiên:
-                              //  1. Phán định vừa lưu trong lượt soi này
-                              //  2. Phán định của lỗi đang ở _currentIndex
-                              //  3. Phán định của lỗi ĐÃ SOI gần nhất trên board
-                              //     (board soi xong / vừa quay lại màn hình -
-                              //     _currentIndex đã vượt cuối danh sách)
-                              //  4. Không có gì -> trạng thái TRUNG TÍNH
-                              //
-                              // Trước đây panel khởi tạo sẵn 'OK' + màu xanh, và
-                              // nếu không nguồn nào có dữ liệu thì giữ nguyên -
-                              // tức báo "OK / Không phát hiện lỗi" cho board chưa
-                              // soi, hoặc mâu thuẫn với bảng lỗi bên dưới đang ghi
-                              // NG. Giờ không có dữ liệu thì nói rõ là chưa có.
-                              //
-                              // Cũng đã bỏ nhánh fallback sang `analysis` của
-                              // AutoVRSWebSocketService: service đó app-scoped và
-                              // màn auto không bao giờ clear, nên nó có thể hiện
-                              // verdict của board KHÁC (do màn thủ công chụp) cho
-                              // board chưa soi gì.
-                              final verdict = latestVerdict.verdict;
-                              final verdictType = latestVerdict.type;
+                            // Dynamic AI Result Panel - shows OK (green) or NG (red)
+                            Builder(
+                              builder: (context) {
+                                // Nguồn dữ liệu cho panel, theo thứ tự ưu tiên:
+                                //  1. Phán định vừa lưu trong lượt soi này
+                                //  2. Phán định của lỗi đang ở _currentIndex
+                                //  3. Phán định của lỗi ĐÃ SOI gần nhất trên board
+                                //     (board soi xong / vừa quay lại màn hình -
+                                //     _currentIndex đã vượt cuối danh sách)
+                                //  4. Không có gì -> trạng thái TRUNG TÍNH
+                                //
+                                // Trước đây panel khởi tạo sẵn 'OK' + màu xanh, và
+                                // nếu không nguồn nào có dữ liệu thì giữ nguyên -
+                                // tức báo "OK / Không phát hiện lỗi" cho board chưa
+                                // soi, hoặc mâu thuẫn với bảng lỗi bên dưới đang ghi
+                                // NG. Giờ không có dữ liệu thì nói rõ là chưa có.
+                                //
+                                // Cũng đã bỏ nhánh fallback sang `analysis` của
+                                // AutoVRSWebSocketService: service đó app-scoped và
+                                // màn auto không bao giờ clear, nên nó có thể hiện
+                                // verdict của board KHÁC (do màn thủ công chụp) cho
+                                // board chưa soi gì.
+                                final verdict = latestVerdict.verdict;
+                                final verdictType = latestVerdict.type;
 
-                              final String verdictShort;
-                              final Color bgColor;
-                              final Color txtColor;
-                              final String detailText;
+                                final String verdictShort;
+                                final Color bgColor;
+                                final Color txtColor;
+                                final String detailText;
 
-                              if (verdict == null) {
-                                verdictShort = '—';
-                                bgColor = Colors.grey.shade200;
-                                txtColor = Colors.grey.shade700;
-                                detailText = 'Chưa có kết quả phán định';
-                              } else if (verdict.toUpperCase() == 'OK') {
-                                verdictShort = 'OK';
-                                bgColor = Colors.green.shade50;
-                                txtColor = Colors.green.shade600;
-                                detailText = 'Không phát hiện lỗi';
-                              } else {
-                                verdictShort = verdict.toUpperCase();
-                                bgColor = Colors.red.shade50;
-                                txtColor = Colors.red.shade600;
-                                detailText =
-                                    (verdictType != null &&
-                                        verdictType.isNotEmpty)
-                                    ? _getDefectDisplayName(verdictType)
-                                    : aiText;
-                              }
+                                if (verdict == null) {
+                                  verdictShort = '—';
+                                  bgColor = Colors.grey.shade200;
+                                  txtColor = Colors.grey.shade700;
+                                  detailText = 'Chưa có kết quả phán định';
+                                } else if (verdict.toUpperCase() == 'OK') {
+                                  verdictShort = 'OK';
+                                  bgColor = Colors.green.shade50;
+                                  txtColor = Colors.green.shade600;
+                                  detailText = 'Không phát hiện lỗi';
+                                } else {
+                                  verdictShort = verdict.toUpperCase();
+                                  bgColor = Colors.red.shade50;
+                                  txtColor = Colors.red.shade600;
+                                  detailText =
+                                      (verdictType != null &&
+                                          verdictType.isNotEmpty)
+                                      ? _getDefectDisplayName(verdictType)
+                                      : aiText;
+                                }
 
-                              return Container(
+                                return Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(20),
+                                  decoration: BoxDecoration(
+                                    color: bgColor,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Column(
+                                    children: [
+                                      Text(
+                                        verdictShort,
+                                        style: TextStyle(
+                                          fontSize: 32,
+                                          fontWeight: FontWeight.bold,
+                                          color: txtColor,
+                                        ),
+                                        textAlign: TextAlign.center,
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        detailText,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: txtColor.withOpacity(0.9),
+                                        ),
+                                        textAlign: TextAlign.center,
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+
+                            const SizedBox(height: 16),
+
+                            // Defect list for currently selected board
+                            DefectListWidget(
+                              boardId: int.tryParse(boardText),
+                              height: 200,
+                              reloadToken: _defectListReloadToken,
+                              processingDefectId: _processingDefectId,
+                            ),
+
+                            const SizedBox(height: 16),
+
+                            // Trạng thái bù lệch của board đang mở - bao gồm cả
+                            // lần calib làm ở tab VRS thủ công.
+                            if (!_calibrating)
+                              _buildOffsetStatusBanner(vrsProvider, boardText),
+
+                            // Thông báo đang calib mặt nào (tránh nhồi chữ vào
+                            // nút "Bắt đầu" gây tràn nút - hiện riêng ở đây).
+                            if (_calibrating) ...[
+                              Container(
                                 width: double.infinity,
-                                padding: const EdgeInsets.all(20),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 10,
+                                  horizontal: 12,
+                                ),
                                 decoration: BoxDecoration(
-                                  color: bgColor,
+                                  color: Colors.blue.shade50,
                                   borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color: Colors.blue.shade200,
+                                  ),
                                 ),
                                 child: Column(
                                   children: [
-                                    Text(
-                                      verdictShort,
-                                      style: TextStyle(
-                                        fontSize: 32,
-                                        fontWeight: FontWeight.bold,
-                                        color: txtColor,
+                                    const SizedBox(
+                                      height: 18,
+                                      width: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
                                       ),
-                                      textAlign: TextAlign.center,
                                     ),
-                                    const SizedBox(height: 6),
+                                    const SizedBox(height: 8),
                                     Text(
-                                      detailText,
+                                      'Đang calib bù lệch board (mặt '
+                                      '${vrsProvider.currentBoardSide}'
+                                      '${vrsProvider.currentBoardSide == "B" ? " - Top" : " - Bot"})...',
+                                      textAlign: TextAlign.center,
                                       style: TextStyle(
                                         fontSize: 12,
-                                        color: txtColor.withOpacity(0.9),
-                                      ),
-                                      textAlign: TextAlign.center,
-                                    ),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-
-                          const SizedBox(height: 16),
-
-                          // Defect list for currently selected board
-                          DefectListWidget(
-                            boardId: int.tryParse(boardText),
-                            height: 200,
-                            reloadToken: _defectListReloadToken,
-                            processingDefectId: _processingDefectId,
-                          ),
-
-                          const SizedBox(height: 16),
-
-                          // Trạng thái bù lệch của board đang mở - bao gồm cả
-                          // lần calib làm ở tab VRS thủ công.
-                          if (!_calibrating)
-                            _buildOffsetStatusBanner(vrsProvider, boardText),
-
-                          // Thông báo đang calib mặt nào (tránh nhồi chữ vào
-                          // nút "Bắt đầu" gây tràn nút - hiện riêng ở đây).
-                          if (_calibrating) ...[
-                            Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.symmetric(
-                                vertical: 10,
-                                horizontal: 12,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.blue.shade50,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: Colors.blue.shade200),
-                              ),
-                              child: Column(
-                                children: [
-                                  const SizedBox(
-                                    height: 18,
-                                    width: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    'Đang calib bù lệch board (mặt '
-                                    '${vrsProvider.currentBoardSide}'
-                                    '${vrsProvider.currentBoardSide == "A" ? " - Top" : " - Bot"})...',
-                                    textAlign: TextAlign.center,
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.blue.shade700,
-                                      fontStyle: FontStyle.italic,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                          ],
-
-                          // Start / Stop operator-driven workflow
-                          Row(
-                            children: [
-                              Expanded(
-                                child: ElevatedButton(
-                                  // Chặn thêm khi `_busy` (đang pre-flight/calib/
-                                  // đưa camera về gốc) và khi `nextBoardAvailable`:
-                                  // lúc đó `currentBoard` vẫn trỏ vào board VỪA
-                                  // XONG (completeCurrentBoardAndCheckNext chỉ
-                                  // reset ở nhánh board cuối lot), nên bấm "Bắt
-                                  // đầu" sẽ calib + soi lại board đã xong và ghi
-                                  // đè hết phán định. Operator phải dùng nút
-                                  // "Board tiếp theo".
-                                  onPressed:
-                                      (boardText != 'Chưa có' &&
-                                          !_running &&
-                                          !_calibrating &&
-                                          !_busy &&
-                                          !vrsProvider.nextBoardAvailable)
-                                      ? () {
-                                          final bId = int.tryParse(boardText);
-                                          if (bId != null) _startWithCalibration(bId);
-                                        }
-                                      : null,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: Colors.green,
-                                  ),
-                                  child: _calibrating
-                                      ? const SizedBox(
-                                          height: 16,
-                                          width: 16,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                            color: Colors.white,
-                                          ),
-                                        )
-                                      : const Text('Bắt đầu'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: ElevatedButton(
-                                  onPressed: _running ? _stopWorkflow : null,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: Colors.red,
-                                  ),
-                                  child: const Text('Dừng'),
-                                ),
-                              ),
-                            ],
-                          ),
-
-                          // Board hiện tại đã hết lỗi - chờ vận hành viên xác
-                          // nhận (lật bo cùng board_code khác layer, hoặc đặt
-                          // board vật lý mới lên bàn) trước khi qua board kế.
-                          if (vrsProvider.nextBoardAvailable) ...[
-                            const SizedBox(height: 16),
-                            Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                color: Colors.blue.shade50,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color: Colors.blue.shade200,
-                                ),
-                              ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    vrsProvider.nextBoardIsNewPhysical
-                                        ? 'Đã xong board hiện tại. Đặt board mới lên bàn rồi bấm tiếp tục.'
-                                        : 'Đã xong board hiện tại. Lật bo rồi bấm tiếp tục.',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: Colors.blue.shade800,
-                                    ),
-                                  ),
-                                  // Thông báo sẽ tự động calib nếu cần. Board
-                                  // kế đã được calib (vd làm bên tab VRS thủ
-                                  // công) thì nói rõ là sẽ hỏi bỏ qua, để
-                                  // operator không tưởng phải chờ thêm 90s.
-                                  if (vrsProvider.calibrationNeeded) ...[
-                                    const SizedBox(height: 6),
-                                    Text(
-                                      vrsProvider.isCalibratedFor(
-                                            boardId: vrsProvider.nextBoardId,
-                                            side: vrsProvider.nextBoardSide,
-                                          )
-                                          ? '✅ Board này đã được calib bù lệch '
-                                                '(mặt ${vrsProvider.nextBoardSide}) '
-                                                '- sẽ hỏi bỏ qua bước calib'
-                                          : '⚙️ Sẽ tự động calib bù lệch board '
-                                                '(mặt ${vrsProvider.nextBoardSide})',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.blue.shade600,
+                                        color: Colors.blue.shade700,
                                         fontStyle: FontStyle.italic,
                                       ),
                                     ),
                                   ],
-                                  const SizedBox(height: 10),
-                                  SizedBox(
-                                    width: double.infinity,
-                                    child: _calibrating
-                                        ? Column(
-                                            children: [
-                                              const SizedBox(
-                                                height: 24,
-                                                width: 24,
-                                                child: CircularProgressIndicator(
-                                                  strokeWidth: 2.5,
-                                                ),
-                                              ),
-                                              const SizedBox(height: 8),
-                                              Text(
-                                                'Đang calib bù lệch board (mặt '
-                                                '${vrsProvider.nextBoardSide}'
-                                                '${vrsProvider.nextBoardSide == "A" ? " - Top" : " - Bot"})...',
-                                                textAlign: TextAlign.center,
-                                                style: TextStyle(
-                                                  fontSize: 12,
-                                                  color: Colors.blue.shade700,
-                                                ),
-                                              ),
-                                            ],
-                                          )
-                                        : ElevatedButton(
-                                            onPressed: _advanceToNextBoard,
-                                            style: ElevatedButton.styleFrom(
-                                              backgroundColor: Colors.blue,
-                                            ),
-                                            child: const Text('Board tiếp theo'),
-                                          ),
-                                  ),
-                                ],
+                                ),
                               ),
-                            ),
-                          ] else if (vrsProvider.lotFinished) ...[
-                            const SizedBox(height: 16),
-                            Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.all(16),
-                              decoration: BoxDecoration(
-                                color: Colors.green.shade50,
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    vrsProvider.lastCompletedBoardId.isNotEmpty
-                                        ? 'Đã hoàn tất board cuối cùng (Board #${vrsProvider.lastCompletedBoardId}). '
-                                              'Không còn board nào khác trong lô này.'
-                                        : 'Đã hoàn tất toàn bộ board trong lô này.',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: Colors.green.shade800,
+                              const SizedBox(height: 12),
+                            ],
+
+                            // Start / Stop operator-driven workflow
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: ElevatedButton(
+                                    // Chặn thêm khi `_busy` (đang pre-flight/calib/
+                                    // đưa camera về gốc) và khi `nextBoardAvailable`:
+                                    // lúc đó `currentBoard` vẫn trỏ vào board VỪA
+                                    // XONG (completeCurrentBoardAndCheckNext chỉ
+                                    // reset ở nhánh board cuối lot), nên bấm "Bắt
+                                    // đầu" sẽ calib + soi lại board đã xong và ghi
+                                    // đè hết phán định. Operator phải dùng nút
+                                    // "Board tiếp theo".
+                                    onPressed:
+                                        (boardText != 'Chưa có' &&
+                                            !_running &&
+                                            !_calibrating &&
+                                            !_busy &&
+                                            !vrsProvider.nextBoardAvailable)
+                                        ? () {
+                                            final bId = int.tryParse(boardText);
+                                            if (bId != null) {
+                                              _startWithCalibration(bId);
+                                            }
+                                          }
+                                        : null,
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.green,
                                     ),
-                                  ),
-                                  const SizedBox(height: 12),
-                                  OutlinedButton.icon(
-                                    onPressed: _checkingNewBoard
-                                        ? null
-                                        : _checkForNewBoardManually,
-                                    icon: _checkingNewBoard
+                                    child: _calibrating
                                         ? const SizedBox(
-                                            width: 14,
-                                            height: 14,
+                                            height: 16,
+                                            width: 16,
                                             child: CircularProgressIndicator(
                                               strokeWidth: 2,
+                                              color: Colors.white,
                                             ),
                                           )
-                                        : const Icon(
-                                            FeatherIcons.refreshCw,
-                                            size: 16,
-                                          ),
-                                    label: Text(
-                                      _checkingNewBoard
-                                          ? 'Đang kiểm tra...'
-                                          : 'Tải lại dữ liệu (kiểm tra board mới)',
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-
-                          const SizedBox(height: 16),
-
-                          // Statistics Button
-                          Consumer<AuthProvider>(
-                            builder: (context, authProvider, _) {
-                              return SizedBox(
-                                width: double.infinity,
-                                child: ElevatedButton.icon(
-                                  onPressed: authProvider.isAdminAuthenticated
-                                      ? () => context.push('/statistics')
-                                      : null,
-                                  icon: const Icon(FeatherIcons.barChart),
-                                  label: const Text('Xem thống kê'),
-                                  style: ElevatedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 12,
-                                    ),
+                                        : const Text('Bắt đầu'),
                                   ),
                                 ),
-                              );
-                            },
-                          ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: ElevatedButton(
+                                    onPressed: _running ? _stopWorkflow : null,
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.red,
+                                    ),
+                                    child: const Text('Dừng'),
+                                  ),
+                                ),
+                              ],
+                            ),
 
-                          const SizedBox(height: 16),
+                            // Board hiện tại đã hết lỗi - chờ vận hành viên xác
+                            // nhận (lật bo cùng board_code khác layer, hoặc đặt
+                            // board vật lý mới lên bàn) trước khi qua board kế.
+                            if (vrsProvider.nextBoardAvailable) ...[
+                              const SizedBox(height: 16),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  color: Colors.blue.shade50,
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color: Colors.blue.shade200,
+                                  ),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      vrsProvider.nextBoardIsNewPhysical
+                                          ? 'Đã xong board hiện tại. Đặt board mới lên bàn rồi bấm tiếp tục.'
+                                          : 'Đã xong board hiện tại. Lật bo rồi bấm tiếp tục.',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.blue.shade800,
+                                      ),
+                                    ),
+                                    // Thông báo sẽ tự động calib nếu cần. Board
+                                    // kế đã được calib (vd làm bên tab VRS thủ
+                                    // công) thì nói rõ là sẽ hỏi bỏ qua, để
+                                    // operator không tưởng phải chờ thêm 90s.
+                                    if (vrsProvider.calibrationNeeded) ...[
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        vrsProvider.isCalibratedFor(
+                                              boardId: vrsProvider.nextBoardId,
+                                              side: vrsProvider.nextBoardSide,
+                                            )
+                                            ? '✅ Board này đã được calib bù lệch '
+                                                  '(mặt ${vrsProvider.nextBoardSide}) '
+                                                  '- sẽ hỏi bỏ qua bước calib'
+                                            : '⚙️ Sẽ tự động calib bù lệch board '
+                                                  '(mặt ${vrsProvider.nextBoardSide})',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.blue.shade600,
+                                          fontStyle: FontStyle.italic,
+                                        ),
+                                      ),
+                                    ],
+                                    const SizedBox(height: 10),
+                                    SizedBox(
+                                      width: double.infinity,
+                                      child: _calibrating
+                                          ? Column(
+                                              children: [
+                                                const SizedBox(
+                                                  height: 24,
+                                                  width: 24,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2.5,
+                                                      ),
+                                                ),
+                                                const SizedBox(height: 8),
+                                                Text(
+                                                  'Đang calib bù lệch board (mặt '
+                                                  '${vrsProvider.nextBoardSide}'
+                                                  '${vrsProvider.nextBoardSide == "B" ? " - Top" : " - Bot"})...',
+                                                  textAlign: TextAlign.center,
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    color: Colors.blue.shade700,
+                                                  ),
+                                                ),
+                                              ],
+                                            )
+                                          : ElevatedButton(
+                                              onPressed: _advanceToNextBoard,
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: Colors.blue,
+                                              ),
+                                              child: const Text(
+                                                'Board tiếp theo',
+                                              ),
+                                            ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ] else if (vrsProvider.lotFinished) ...[
+                              const SizedBox(height: 16),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  color: Colors.green.shade50,
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      vrsProvider
+                                              .lastCompletedBoardId
+                                              .isNotEmpty
+                                          ? 'Đã hoàn tất board cuối cùng (Board #${vrsProvider.lastCompletedBoardId}). '
+                                                'Không còn board nào khác trong lô này.'
+                                          : 'Đã hoàn tất toàn bộ board trong lô này.',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.green.shade800,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 12),
+                                    OutlinedButton.icon(
+                                      onPressed: _checkingNewBoard
+                                          ? null
+                                          : _checkForNewBoardManually,
+                                      icon: _checkingNewBoard
+                                          ? const SizedBox(
+                                              width: 14,
+                                              height: 14,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(
+                                              FeatherIcons.refreshCw,
+                                              size: 16,
+                                            ),
+                                      label: Text(
+                                        _checkingNewBoard
+                                            ? 'Đang kiểm tra...'
+                                            : 'Tải lại dữ liệu (kiểm tra board mới)',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ] else if (vrsProvider.batchFinished) ...[
+                              // Đợt (khoảng board) đang chạy đã hết việc - có
+                              // thể vì vừa xử lý xong board cuối đợt (lot còn
+                              // board khác NGOÀI đợt), hoặc lot này chưa từng
+                              // có đợt nào (vd vừa khởi động app). CẢ 2 trường
+                              // hợp đều cần vận hành viên chọn 1 đợt mới trước
+                              // khi tiếp tục - xem VRSProvider.batchFinished.
+                              const SizedBox(height: 16),
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(16),
+                                decoration: BoxDecoration(
+                                  color: Colors.orange.shade50,
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      vrsProvider.lastBatchStartCode.isNotEmpty
+                                          ? 'Đã xử lý xong đợt '
+                                                '(${vrsProvider.lastBatchStartCode} → '
+                                                '${vrsProvider.lastBatchEndCode}). '
+                                                'Lô này còn board chưa kiểm tra.'
+                                          : 'Lô này chưa có đợt (khoảng board) '
+                                                'nào đang chạy.',
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.orange.shade800,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 12),
+                                    ElevatedButton.icon(
+                                      onPressed: () async {
+                                        final idLot = int.tryParse(
+                                          vrsProvider.currentLot,
+                                        );
+                                        if (idLot == null) return;
+                                        final idBatch = await context.push<int>(
+                                          '/select-board-batch/$idLot',
+                                        );
+                                        if (idBatch != null) {
+                                          await vrsProvider
+                                              .refreshActiveBatch();
+                                        }
+                                      },
+                                      icon: const Icon(
+                                        FeatherIcons.list,
+                                        size: 16,
+                                      ),
+                                      label: const Text('Chọn đợt mới'),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: Colors.orange.shade600,
+                                        foregroundColor: Colors.white,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
 
-                          // // Manual review button
-                          // SizedBox(
-                          //   width: double.infinity,
-                          //   child: ElevatedButton.icon(
-                          //     onPressed: () {
-                          //       Navigator.of(context).push(
-                          //         MaterialPageRoute(
-                          //           builder: (context) => ManualVRSScreen(),
-                          //         ),
-                          //       );
-                          //     },
-                          //     icon: const Icon(FeatherIcons.edit3),
-                          //     label: const Text('Phán định thủ công'),
-                          //     style: ElevatedButton.styleFrom(
-                          //       backgroundColor: Colors.orange,
-                          //       foregroundColor: Colors.white,
-                          //       padding: const EdgeInsets.symmetric(vertical: 12),
-                          //     ),
-                          //   ),
-                          // ),
-                        ],
+                            const SizedBox(height: 16),
+
+                            // Statistics Button
+                            Consumer<AuthProvider>(
+                              builder: (context, authProvider, _) {
+                                return SizedBox(
+                                  width: double.infinity,
+                                  child: ElevatedButton.icon(
+                                    onPressed: authProvider.isAdminAuthenticated
+                                        ? () => context.push('/statistics')
+                                        : null,
+                                    icon: const Icon(FeatherIcons.barChart),
+                                    label: const Text('Xem thống kê'),
+                                    style: ElevatedButton.styleFrom(
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 12,
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+
+                            const SizedBox(height: 16),
+
+                            // // Manual review button
+                            // SizedBox(
+                            //   width: double.infinity,
+                            //   child: ElevatedButton.icon(
+                            //     onPressed: () {
+                            //       Navigator.of(context).push(
+                            //         MaterialPageRoute(
+                            //           builder: (context) => ManualVRSScreen(),
+                            //         ),
+                            //       );
+                            //     },
+                            //     icon: const Icon(FeatherIcons.edit3),
+                            //     label: const Text('Phán định thủ công'),
+                            //     style: ElevatedButton.styleFrom(
+                            //       backgroundColor: Colors.orange,
+                            //       foregroundColor: Colors.white,
+                            //       padding: const EdgeInsets.symmetric(vertical: 12),
+                            //     ),
+                            //   ),
+                            // ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-            ],
-          ),
-        );
-      },
+              ],
+            ),
+          );
+        },
+      ),
     );
+  }
+
+  /// Phím tắt ở màn Auto VRS:
+  /// - Enter = BẮT ĐẦU quy trình, y hệt điều kiện enable của nút "Bắt đầu".
+  /// - Space = CHỈ DỪNG (không dùng để bắt đầu nữa, tránh nhầm 1 phím làm 2
+  ///   việc ngược nhau) — y hệt điều kiện enable của nút "Dừng" (`_running`).
+  /// - → = "Board tiếp theo" (giống bấm nút cùng tên), chỉ khi nút đó đang
+  ///   hiện ra (`nextBoardAvailable && !_calibrating`) — không có tác dụng gì
+  ///   ở các thời điểm khác nên an toàn để gán, không đụng phím nào khác vì
+  ///   màn Auto không có điều hướng lỗi thủ công như Manual VRS.
+  /// Không gán Esc ở màn này (ngoài Enter/Space/→) vì các hộp thoại
+  /// (resume/restart...) có lựa chọn rủi ro cao (vd "Vẫn chuyển bo" bỏ qua
+  /// lỗi chưa phán định) — cố tình để thao tác bằng chuột cho những bước đó.
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+
+    final vrsProvider = Provider.of<VRSProvider>(context, listen: false);
+
+    if (event.logicalKey == LogicalKeyboardKey.arrowRight) {
+      if (vrsProvider.nextBoardAvailable && !_calibrating) {
+        _advanceToNextBoard();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.space) {
+      if (_running) {
+        _stopWorkflow();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+
+    if (event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+      if (_running) return KeyEventResult.ignored;
+
+      final boardText =
+          (vrsProvider.currentBoard.isNotEmpty &&
+              vrsProvider.currentBoard != 'Chưa có')
+          ? vrsProvider.currentBoard
+          : 'Chưa có';
+
+      if (boardText != 'Chưa có' &&
+          !_calibrating &&
+          !_busy &&
+          !vrsProvider.nextBoardAvailable) {
+        final bId = int.tryParse(boardText);
+        if (bId != null) {
+          _startWithCalibration(bId);
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    }
+
+    return KeyEventResult.ignored;
   }
 
   Widget _buildInfoRow(String label, String value) {
